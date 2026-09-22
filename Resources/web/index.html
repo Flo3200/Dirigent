@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Dirigent</title>
+  <meta name="theme-color" content="#0a0b14">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="icon.svg" alt="" class="brand-mark">
+        <div>
+          <div class="brand-name">Dirigent</div>
+          <div class="brand-sub">Agent Orchestra</div>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="sidebar-foot">
+        <button class="btn btn-glow w-full" data-action="join">
+          <span class="ico" data-ico="plus"></span> Agent anmelden
+        </button>
+        <div class="server-card" id="serverCard"></div>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="viewTitle">Übersicht</h1>
+          <p id="viewSub" class="muted"></p>
+        </div>
+        <div class="top-actions" id="topActions"></div>
+      </header>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+  <div id="drawer" class="drawer" aria-hidden="true"></div>
+  <div id="modalRoot"></div>
+  <div id="toasts" class="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>

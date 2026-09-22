@@ -1,0 +1,7 @@
+build/
+DerivedData/
+*.xcodeproj/
+.DS_Store
+xcuserdata/
+# App-Icon wird von scripts/make-icon.swift erzeugt
+Resources/Assets.xcassets/AppIcon.appiconset/*.png
