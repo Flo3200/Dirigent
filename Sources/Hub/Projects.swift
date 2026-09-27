@@ -33,6 +33,15 @@ extension Hub {
         return n == "Du" ? "Du hast" : "\(n) hat"
     }
 
+    /// Ordner für die Beschreibungsdateien eines Projekts (Unterprojekte liegen im Ordner des übergeordneten).
+    func projectDocDir(_ p: Project, depth: Int = 0) -> String {
+        if depth < 10, let pp = p.parentProjectId, let parent = db.projects.first(where: { $0.id == pp }) {
+            let part = parent.parts.first(where: { $0.id == p.parentPartId })
+            return projectDocDir(parent, depth: depth + 1) + "/" + Hub.slug(part?.key ?? p.name, max: 30)
+        }
+        return ".dirigent/" + Hub.slug(p.name, max: 40)
+    }
+
     func planActive(_ p: Project) -> Bool {
         db.tasks.contains { $0.projectId == p.id && $0.partId == nil && $0.kind == "task" && ($0.status == "queued" || $0.status == "running")
             && $0.createdAt > (p.planSubmittedAt ?? 0) }
@@ -84,7 +93,8 @@ extension Hub {
         var target = "manager"
         if let m = p.managerId, db.agents.contains(where: { $0.id == m }) { target = "agent:\(m)" }
         switch createTasks(prompt: prompt, title: "Projektplan: \(p.name)\(fb.isEmpty ? "" : " (Überarbeitung)")", target: target,
-                           createdBy: createdBy, priority: 3, projectId: p.id) {
+                           createdBy: createdBy, priority: 3, projectId: p.id,
+                           docPath: p.revision == 0 && fb.isEmpty ? projectDocDir(p) + "/README.md" : nil) {
         case .success(let ts):
             guard let t = ts.first, let pi2 = projectIndex(id) else { return .failure(.msg("Planungsauftrag fehlt")) }
             db.projects[pi2].planTaskIds.append(t.id)
@@ -165,7 +175,7 @@ extension Hub {
         guard errors.isEmpty else { return .failure(.msg("Plan NICHT gespeichert:\n- " + errors.joined(separator: "\n- "))) }
 
         // Hinweise (Plan wird trotzdem gespeichert)
-        if rawStandards != nil && standards.count < 12 { warnings.append("Nur \(standards.count) Standards – Richtwert sind 15–40 präzise, prüfbare Regeln.") }
+        if rawStandards != nil && standards.count + p.standards.filter({ $0.inherited == true }).count < 12 { warnings.append("Nur \(standards.count) Standards – Richtwert sind 15–40 präzise, prüfbare Regeln.") }
         for part in fresh {
             if part.acceptance.isEmpty { warnings.append("„\(part.name)“: keine Abnahmekriterien (acceptance).") }
             if part.paths.isEmpty { warnings.append("„\(part.name)“: keine Pfade (paths) – Zuständigkeit unklar.") }
@@ -179,7 +189,7 @@ extension Hub {
         }
 
         p.parts = all
-        if rawStandards != nil { p.standards = standards }
+        if rawStandards != nil { p.standards = p.standards.filter { $0.inherited == true } + standards }
         if let s = j.str("summary"), !s.isEmpty { p.summary = s }
         p.revision += 1
         p.planSubmittedAt = nowMs()
@@ -273,10 +283,15 @@ extension Hub {
         let p = db.projects[pi]
         let part = p.parts[k]
         var target = "any"
-        if let a = part.agentId, db.agents.contains(where: { $0.id == a }) { target = "agent:\(a)" }
+        if let a = part.agentId, let ag = db.agents.first(where: { $0.id == a }) {
+            target = "agent:\(a)"
+            // Baukasten: Ein Manager bekommt den Teilbereich als eigenes Unterprojekt und orchestriert sein Team selbst.
+            if ag.role == "manager" && a != p.managerId { launchSubProject(pi, partId, managerId: a); return }
+        }
         db.projects[pi].parts[k].status = "queued"
         let res = createTasks(prompt: Texts.partPrompt(p, part, hub: self), title: "\(p.name) · \(part.name)", target: target,
-                              createdBy: "project:\(p.id)", parentId: p.planTaskIds.last, priority: 2, projectId: p.id, partId: part.id)
+                              createdBy: "project:\(p.id)", parentId: p.planTaskIds.last, priority: 2, projectId: p.id, partId: part.id,
+                              docPath: projectDocDir(p) + "/" + Hub.slug(part.key, max: 30) + ".md")
         guard let k2 = db.projects[pi].parts.firstIndex(where: { $0.id == partId }) else { return }
         switch res {
         case .success(let ts):
@@ -287,6 +302,63 @@ extension Hub {
             db.projects[pi].parts[k2].note = "Start fehlgeschlagen: \(e)"
             projectLog(pi, "Start von „\(part.name)“ fehlgeschlagen: \(e)")
         }
+    }
+
+    private func launchSubProject(_ pi: Int, _ partId: String, managerId: String) {
+        guard let k = db.projects[pi].parts.firstIndex(where: { $0.id == partId }) else { return }
+        let p = db.projects[pi], part = p.parts[k]
+        let t = nowMs()
+        var child = Project(id: makeId("pj", 6), name: "\(p.name) › \(part.name)", goal: Texts.partPrompt(p, part, hub: self), cwd: p.cwd,
+                            managerId: managerId, status: "planning", summary: "", standards: [], parts: [], planTaskIds: [],
+                            revision: 0, requireReview: p.requireReview, log: [], createdAt: t, updatedAt: t, finishedAt: nil)
+        child.parentProjectId = p.id
+        child.parentPartId = part.id
+        child.standards = p.standards.enumerated().map { n, s in
+            var x = s; x.id = "P\(n + 1)"; x.inherited = true; x.category = "Übergeordnet · " + s.category.replacingOccurrences(of: "Übergeordnet · ", with: ""); return x
+        }
+        db.projects.append(child)
+        db.projects[pi].parts[k].status = "running"
+        db.projects[pi].parts[k].childProjectId = child.id
+        let mName = db.agents.first(where: { $0.id == managerId })?.name ?? "?"
+        projectLog(pi, "„\(part.name)“ läuft als Unterprojekt, geplant von Manager \(mName)")
+        if let ci = db.projects.firstIndex(where: { $0.id == child.id }) {
+            projectLog(ci, "Unterprojekt von „\(p.name)“ · Teilbereich „\(part.name)“ – \(child.standards.count) Standards übernommen")
+        }
+        emit("project.created", "Unterprojekt: \(child.name) → \(mName)", ref: child.id)
+        _ = requestPlan(child.id, feedback: nil, createdBy: "project:\(p.id)")
+    }
+
+    /// Unterprojekt fertig/abgebrochen → Teilbereich im übergeordneten Projekt fortschreiben.
+    func childProjectFinished(_ ci: Int) {
+        let c = db.projects[ci]
+        guard let pp = c.parentProjectId, let pi = db.projects.firstIndex(where: { $0.id == pp }),
+              let k = db.projects[pi].parts.firstIndex(where: { $0.id == c.parentPartId && $0.childProjectId == c.id }) else { return }
+        let part = db.projects[pi].parts[k]
+        guard ["running", "queued", "waiting"].contains(part.status) else { return }
+        if c.status == "cancelled" {
+            db.projects[pi].parts[k].status = "cancelled"
+            projectLog(pi, "Unterprojekt für „\(part.name)“ wurde abgebrochen")
+            recomputeProject(pi)
+            return
+        }
+        let summary = "Unterprojekt „\(c.name)“ abgeschlossen (\(c.parts.count) Teilbereiche).\n\n" + c.parts.map { x in
+            "### \(x.name)\n" + String((x.result ?? "(kein Ergebnis)").prefix(1500))
+        }.joined(separator: "\n\n")
+        db.projects[pi].parts[k].result = summary
+        db.projects[pi].parts[k].finishedAt = nowMs()
+        let fake = TaskItem(id: "sub-" + c.id, title: c.name, prompt: "", target: "", status: "done", assignedAgentId: c.managerId, result: summary,
+                            error: nil, progress: [], createdAt: nowMs(), startedAt: nil, finishedAt: nowMs(), createdBy: "system", parentId: nil,
+                            notifyAgentId: nil, templateId: nil, runId: nil, stepIndex: nil, priority: 0, kind: "task", projectId: pp, partId: part.id)
+        if db.projects[pi].requireReview {
+            db.projects[pi].parts[k].status = "delivered"
+            projectLog(pi, "Unterprojekt „\(part.name)“ abgeliefert – wartet auf Abnahme")
+            notifyManagerReview(pi, k, fake, success: true)
+        } else {
+            db.projects[pi].parts[k].status = "accepted"
+            projectLog(pi, "Unterprojekt „\(part.name)“ erledigt")
+            startReadyParts(pi)
+        }
+        recomputeProject(pi)
     }
 
     /// Freigabe zurückziehen (nur solange der Worker noch nicht angefangen hat).
@@ -398,6 +470,7 @@ extension Hub {
 
         --- Abnahmekriterien ---
         \(criteria.isEmpty ? "(keine definiert)" : criteria)
+        \(db.tasks.first(where: { $0.id == t.id })?.docFile.map { "\n--- Beschreibungsdatei (mitprüfen: vollständig und präzise?) ---\n\($0)" } ?? "")
         """
         _ = createTasks(prompt: body, title: "Abnahme: \(p.name) · \(part.name)", target: "agent:\(mid)", createdBy: "project:\(p.id)",
                         parentId: p.planTaskIds.last, priority: 5, kind: "notification", projectId: p.id, partId: part.id)
@@ -413,6 +486,10 @@ extension Hub {
         }
         projectLog(pi, "\(actorHas(by)) das Projekt abgebrochen")
         emit("project.cancelled", "Projekt abgebrochen: \(db.projects[pi].name)", ref: pid)
+        for ci in db.projects.indices where db.projects[ci].parentProjectId == pid && !["done", "cancelled"].contains(db.projects[ci].status) {
+            cancelProject(ci, by: by)
+        }
+        if db.projects[pi].parentProjectId != nil { childProjectFinished(pi) }
     }
 
     /// Projektstatus aus Planungsauftrag und Teilbereichen ableiten.
@@ -432,6 +509,7 @@ extension Hub {
                 db.projects[pi].finishedAt = nowMs()
                 projectLog(pi, "🏁 Alle Teilbereiche abgenommen – Projekt abgeschlossen")
                 emit("project.completed", "Projekt abgeschlossen: \(p.name)", ref: p.id)
+                if p.parentProjectId != nil { childProjectFinished(pi) }
                 if db.settings.notifications {
                     let cb = onNotify, title = "🏁 Projekt fertig: \(p.name)", body = "\(p.parts.count) Teilbereiche abgenommen."
                     DispatchQueue.main.async { cb?(title, body) }
@@ -531,6 +609,14 @@ extension Hub {
             }
             if asJSON { return .json(["approved": ok, "errors": errs, "project": toJSONObject(db.projects[pi])]) }
             return .text("✅ \(ok) Teilbereich(e) freigegeben.\(errs.isEmpty ? "" : "\n" + errs.joined(separator: "\n"))\n")
+        case ("POST", "message"):
+            let body = rawText("text").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !body.isEmpty else { return .error("Text fehlt", text: !asJSON) }
+            guard let mid = db.projects[pi].managerId, agentExists(mid) else { return .error("Dieses Projekt hat keinen angemeldeten Manager", status: 409, text: !asJSON) }
+            let fromRef = from.flatMap { agentIndex($0) }.map { "agent:\(db.agents[$0].id)" } ?? "user"
+            let msg = sendMessage(from: fromRef, to: "agent:\(mid)", text: body, kind: "supplement", projectId: pid, urgent: p.bool("urgent") ?? false)
+            projectLog(pi, "\(actorHas(from)) eine Ergänzung an den Manager geschickt: \(body.prefix(140))")
+            return asJSON ? .json(toJSONObject(msg), status: 201) : .text("✉️ Ergänzung an den Manager gesendet.\n")
         case ("POST", "cancel"):
             cancelProject(pi, by: from)
             return asJSON ? .json(toJSONObject(db.projects[pi])) : .text("Projekt abgebrochen.\n")

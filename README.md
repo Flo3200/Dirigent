@@ -13,6 +13,11 @@ Jede Claude-Code-Session (oder jedes andere Programm, das HTTP spricht) meldet s
 - **Vorlagen:** vorgefertigte Aufgaben mit `{{variablen}}`, optional mit Zeitplan (alle *n* Minuten)
 - **Workflows:** mehrstufige Abläufe (`{{input}}`, `{{prev}}`, `{{step1}}` …), z. B. *Bauen → Prüfen → Fixen*
 - **Projekte mit Freigabe:** Ein Manager zerlegt eine Aufgabe in Teilbereiche und legt sehr präzise Standards fest. Du prüfst den Plan, teilst Agenten ein und gibst frei. **Erst nach deiner Freigabe** erhält ein Worker seinen Auftrag. Der Manager nimmt jede Ablieferung ab (siehe unten).
+- **Rückfragen statt Raten:** Jeder Agent soll bei Unklarheiten nachfragen. Die Frage geht an seinen Manager, und wenn der es nicht weiß, weiter an dessen Vorgesetzten bis zu dir. Der fragende Agent wartet ohne Tokenverbrauch auf die Antwort.
+- **Chats wie in Claude:** Jeder Auftrag und jeder Agent hat einen Chat mit Auftrag, Zwischenständen, Rückfragen, Antworten, Nachrichten und Ergebnis. Der Tab **Live** zeigt die Claude-Code-Sitzung des Agenten mit Texten, Befehlen und Ausgaben.
+- **Direkte Nachrichten & Unterbrechen:** Schreib einem Agenten direkt oder schick eine Ergänzung an den Manager, der sie zerlegt und verteilt. „⛔ Unterbrechen“ lässt den Agenten beim nächsten Kontakt sofort anhalten.
+- **Beschreibungsdatei je Auftrag:** Dirigent legt `.dirigent/…md` im Arbeitsordner an, mit dem Auftrag wörtlich. Der Agent ergänzt die Datei wie eine README: Umsetzung, Entscheidungen, Schnittstellen, Dateien, Nutzung, Tests, Abweichungen und Rückfragen.
+- **Baukasten / Organigramm:** Agenten unterstehen Managern, Manager wiederum anderen Managern (ein Orchestrator über mehreren Orchestratoren). Ziel `team:<manager>` geht an einen freien Agenten des Teams. Wird ein Projekt-Teilbereich einem Manager zugeteilt, läuft er automatisch als **Unterprojekt** mit eigenem Plan und den übernommenen Standards.
 - **Manager-Rolle:** Ein angemeldeter Agent kann zum Manager ernannt werden. Er bekommt Ziele, sieht alle Agenten, delegiert Teilaufträge und wird bei jeder Rückmeldung automatisch geweckt.
 - **Zielsteuerung:** `any` · `manager` · `all` · `agent:<name>` · `tag:<tag>` · Prioritäten
 - **Offen integrierbar:** REST-API, Server-Sent Events (`/api/events`), Webhooks, Text-Endpunkte für Agenten, API-Key, optionaler WLAN-Zugriff (z. B. vom iPad)
@@ -78,6 +83,28 @@ curl -s -X POST http://127.0.0.1:7777/api/projects -H 'Content-Type: application
 curl -s "http://127.0.0.1:7777/api/projects/<id>?format=text"     # Überblick als Text
 ```
 
+## Regeln für Agenten (stehen in jeder Anleitung und jedem Auftrag)
+
+1. **Rückfragen statt raten:** `POST /api/tasks/<id>/ask`. Die Antwort enthält einen Warte-Befehl für den Hintergrund. Der Agent wird mit der Antwort geweckt.
+2. **Zwischenstand = Postfach:** Nach jedem größeren Schritt `POST /api/tasks/<id>/progress`. Die Antwort enthält neue Nachrichten, Ergänzungen und Unterbrechungen, die der Agent sofort befolgen muss.
+3. **Beschreibungsdatei:** Die Datei, die Dirigent nennt, vollständig und präzise ausfüllen und aktuell halten. Sie ist Teil der Abnahme.
+
+> Zustellung ist kooperativ: Ein Agent, der gerade wartet, wird sofort geweckt. Ein Agent, der gerade arbeitet, erhält Nachrichten und Unterbrechungen beim nächsten Zwischenstand, bei einer Rückfrage oder beim nächsten Auftrag.
+
+## Baukasten: Orchestrator über Orchestratoren
+
+```
+                 👑 Chef-Orchestrator
+            ┌──────────┴──────────┐
+     👑 App-Lead              👑 Backend-Lead         ← Unter-Manager (supervisor = Chef)
+     ├ ios-dev                ├ api-dev               ← Worker (supervisor = Lead)
+     └ ui-dev                 └ db-dev
+```
+
+- Anmelden mit Vorgesetztem: `curl -s "http://127.0.0.1:7777/join?name=ios-dev&supervisor=app-lead"`, oder im Dashboard unter Agent → Bearbeiten → „Untersteht“.
+- Der Chef delegiert an Leads (`target=agent:app-lead`) oder an Teams (`target=team:app-lead`). Rückfragen laufen die Kette hinauf.
+- Im Projekt einen Teilbereich einem Manager zuteilen: Daraus wird ein Unterprojekt, das der Lead selbst plant. Du gibst frei, und das Ergebnis fließt als Ablieferung zurück.
+
 ## API (Auszug)
 
 | Methode | Pfad | Zweck |
@@ -93,6 +120,9 @@ curl -s "http://127.0.0.1:7777/api/projects/<id>?format=text"     # Überblick a
 | POST | `/api/projects` | Projekt anlegen, Planung beim Manager anfordern |
 | POST | `/api/projects/:id/plan` | Manager reicht Plan ein (Standards + Teilbereiche) |
 | POST | `/api/projects/:id/parts/:pid/approve` · `accept` · `rework` | Freigeben · Abnehmen · Nacharbeit |
+| POST | `/api/tasks/:id/ask` · `/api/messages/:id/answer` · `/escalate` | Rückfrage · Antwort · weiterleiten |
+| POST | `/api/agents/:id/messages` · `/api/tasks/:id/message` · `/api/projects/:id/message` | Nachricht an Agent · an Agent des Auftrags · Ergänzung an Manager |
+| GET | `/api/agents/:id/transcript` · `/api/tasks/:id/doc` | Live-Protokoll · Beschreibungsdatei |
 | GET | `/api/events` | Live-Ereignisse (SSE) |
 | GET | `/api/state` · `/api/overview` · `/api/docs` | Zustand · Text-Überblick · alle Endpunkte |
 

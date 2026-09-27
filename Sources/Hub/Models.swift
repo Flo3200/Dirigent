@@ -20,6 +20,8 @@ struct Agent: Codable {
     var lastSeen: Double
     var completed: Int
     var failed: Int
+    /// Vorgesetzter (Manager/Orchestrator) – daraus entsteht das Organigramm.
+    var supervisorId: String? = nil
 }
 
 struct ProgressEntry: Codable {
@@ -53,6 +55,28 @@ struct TaskItem: Codable {
     /// Gehört zu einem Projekt: Planungsauftrag (partId == nil) oder freigegebener Teilbereich.
     var projectId: String? = nil
     var partId: String? = nil
+    /// Beschreibungsdatei: relativer Pfad (bei Erstellung) und absoluter Pfad (nach Zustellung).
+    var docPath: String? = nil
+    var docFile: String? = nil
+}
+
+/// Nachricht zwischen Nutzer, Agenten und Managern (Chat, Rückfrage, Antwort, Ergänzung).
+struct Message: Codable {
+    var id: String
+    var time: Double
+    var from: String            // user | system | agent:<id>
+    var to: String              // user | agent:<id> | task (an den Agenten, der den Auftrag bekommt)
+    var taskId: String?
+    var projectId: String?
+    var kind: String            // message | question | answer | supplement | system
+    var text: String
+    var urgent: Bool
+    var replyTo: String?
+    var status: String          // pending | delivered | answered
+    var deliveredAt: Double?
+    var viaTaskId: String?      // Nachrichten-Auftrag, der sie zugestellt hat
+    var answer: String?
+    var answeredAt: Double?
 }
 
 struct Template: Codable {
@@ -103,6 +127,7 @@ struct ProjectStandard: Codable {
     var title: String
     var rule: String
     var mandatory: Bool         // true = MUSS, false = SOLL
+    var inherited: Bool? = nil  // vom übergeordneten Projekt übernommen
 }
 
 /// Teilbereich eines Projekts, den genau ein Agent bearbeitet.
@@ -127,6 +152,8 @@ struct ProjectPart: Codable {
     var round: Int              // 1 = erste Ausführung, ab 2 = Nacharbeit
     var approvedAt: Double?
     var finishedAt: Double?
+    /// Einem Manager zugeteilt → läuft als eigenes Unterprojekt.
+    var childProjectId: String? = nil
 }
 
 struct Project: Codable {
@@ -148,6 +175,9 @@ struct Project: Codable {
     var finishedAt: Double?
     /// Zeitpunkt des letzten eingereichten Plans – danach gilt ein offener Planungsauftrag nicht mehr als „plant noch“.
     var planSubmittedAt: Double? = nil
+    /// Baukasten: Unterprojekt eines Teilbereichs eines übergeordneten Projekts.
+    var parentProjectId: String? = nil
+    var parentPartId: String? = nil
 }
 
 struct Webhook: Codable {
@@ -164,6 +194,8 @@ struct Settings: Codable {
     var lanAccess: Bool
     var apiKey: String
     var notifications: Bool
+    /// Beschreibungsdatei (.dirigent/…md) für normale Aufträge standardmäßig verlangen (nil = an).
+    var docFiles: Bool? = nil
 
     static let `default` = Settings(port: 7777, lanAccess: false, apiKey: "", notifications: true)
 }
@@ -184,6 +216,7 @@ struct Database: Codable {
     var runs: [WorkflowRun] = []
     var webhooks: [Webhook] = []
     var projects: [Project] = []
+    var messages: [Message] = []
     var settings: Settings = .default
     var events: [EventEntry] = []
 
@@ -199,6 +232,7 @@ struct Database: Codable {
         runs = (try? c.decode([WorkflowRun].self, forKey: .runs)) ?? []
         webhooks = (try? c.decode([Webhook].self, forKey: .webhooks)) ?? []
         projects = (try? c.decode([Project].self, forKey: .projects)) ?? []
+        messages = (try? c.decode([Message].self, forKey: .messages)) ?? []
         settings = (try? c.decode(Settings.self, forKey: .settings)) ?? .default
         events = (try? c.decode([EventEntry].self, forKey: .events)) ?? []
     }

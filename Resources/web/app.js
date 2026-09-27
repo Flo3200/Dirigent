@@ -34,6 +34,8 @@ const P = {
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   hook: '<path d="M18 16.1A5 5 0 0 1 15 7M6 16.1a5 5 0 1 0 6 2.9M12 6a3 3 0 1 1 0 .01M6 16l6-10 6 10"/>',
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+  chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/><path d="M8.5 12h.01M12 12h.01M15.5 12h.01"/>',
+  org: '<rect x="9" y="3" width="6" height="5" rx="1.5"/><rect x="3" y="16" width="6" height="5" rx="1.5"/><rect x="15" y="16" width="6" height="5" rx="1.5"/><path d="M12 8v4M6 16v-2h12v2"/>',
   layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/><path d="m3 17.5 9 5 9-5" opacity=".55"/>',
   shield: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
@@ -42,12 +44,14 @@ const icon = (n, cls = '') => `<span class="ico ${cls}"><svg viewBox="0 0 24 24"
 function hydrateIcons(root = document) { root.querySelectorAll('[data-ico]').forEach(el => { el.outerHTML = icon(el.dataset.ico); }); }
 
 /* ───────── Zustand ───────── */
-let S = { agents: [], tasks: [], templates: [], workflows: [], runs: [], webhooks: [], projects: [], events: [], settings: {}, server: {} };
+let S = { agents: [], tasks: [], templates: [], workflows: [], runs: [], webhooks: [], projects: [], messages: [], events: [], settings: {}, server: {} };
 let docs = [];
 const ui = {
   view: (() => { try { return localStorage.getItem('dirigent.view') || 'overview'; } catch { return 'overview'; } })(),
   taskFilter: 'all', taskSearch: '', drawerTask: null, connected: false,
   project: null, openParts: new Set(), ask: null,
+  chatAgent: null, chatTab: 'chat', drawerTab: 'chat',
+  agentsMode: (() => { try { return localStorage.getItem('dirigent.agentsMode') || 'cards'; } catch { return 'cards'; } })(),
 };
 
 const api = async (method, path, body) => {
@@ -83,6 +87,8 @@ function connectEvents() {
     else if (ev.type === 'agent.registered') toast('👋', ev.message);
     else if (ev.type === 'workflow.completed') toast('🎼', ev.message);
     else if (ev.type === 'project.planned') toast('📋', ev.message);
+    else if (ev.type === 'message.question' && ev.data?.to === 'user') toast('❓', ev.message);
+    else if (ev.type === 'message.sent' && ev.data?.to === 'user' && ev.data?.from !== 'user') toast('💬', ev.message);
     else if (ev.type === 'project.part.rework') toast('🔁', ev.message);
     else if (ev.type === 'project.completed') toast('🏁', ev.message);
   };
@@ -120,6 +126,7 @@ function targetLabel(t) {
   if (t === 'all') return 'Alle Worker';
   if (t.startsWith('agent:')) { const r = t.slice(6); const a = S.agents.find(x => x.id === r || x.name.toLowerCase() === r.toLowerCase()); return a ? a.name : r; }
   if (t.startsWith('tag:')) return '#' + t.slice(4);
+  if (t.startsWith('team:')) return 'Team ' + (agentById(t.slice(5))?.name || t.slice(5));
   return t;
 }
 const hlVars = (s) => esc(s).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, '<span class="var">{{$1}}</span>');
@@ -163,6 +170,7 @@ const joinPrompt = (role = 'worker') => role === 'manager'
 const VIEWS = [
   { id: 'overview', label: 'Übersicht', icon: 'home', sub: 'Dein Orchester auf einen Blick' },
   { id: 'projects', label: 'Projekte', icon: 'layers', sub: 'Manager plant · du teilst ein und gibst frei · Worker setzen um' },
+  { id: 'chats', label: 'Chats', icon: 'chat', sub: 'Mit jedem Agenten schreiben, Rückfragen beantworten, live mitlesen, unterbrechen' },
   { id: 'agents', label: 'Agenten', icon: 'bot', sub: 'Angemeldete KI-Agenten – bereit ohne Token-Verbrauch' },
   { id: 'tasks', label: 'Aufträge', icon: 'list', sub: 'Alle Aufträge, live verteilt' },
   { id: 'templates', label: 'Vorlagen', icon: 'template', sub: 'Vorgefertigte Aufgaben, die Agenten als Prompt erhalten' },
@@ -181,10 +189,11 @@ function renderNav() {
     projects: (S.projects || []).filter(p => p.status !== 'done' && p.status !== 'cancelled').length,
   };
   const needsYou = (S.projects || []).some(p => projAttention(p).length);
+  counts.chats = openQuestionsToUser().length;
   $('#nav').innerHTML = VIEWS.map(v => v.sep ? '<div class="nav-sep"></div>' : `
     <button class="nav-item ${ui.view === v.id ? 'active' : ''}" data-action="nav" data-view="${v.id}">
       ${icon(v.icon)}<span>${v.label}</span>
-      ${counts[v.id] ? `<span class="count ${v.id === 'agents' || v.id === 'tasks' || v.id === 'workflows' || (v.id === 'projects' && needsYou) ? 'live' : ''}" ${v.id === 'projects' && needsYou ? 'title="Braucht deine Freigabe"' : ''}>${counts[v.id]}</span>` : ''}
+      ${counts[v.id] ? `<span class="count ${v.id === 'agents' || v.id === 'tasks' || v.id === 'workflows' || v.id === 'chats' || (v.id === 'projects' && needsYou) ? 'live' : ''}" ${v.id === 'projects' && needsYou ? 'title="Braucht deine Freigabe"' : ''}>${counts[v.id]}</span>` : ''}
     </button>`).join('');
 }
 
@@ -214,7 +223,11 @@ function render() {
     integrate: `<button class="btn" data-action="open-browser">${icon('globe')} Im Browser öffnen</button>`,
   };
   $('#topActions').innerHTML = actions[ui.view] || '';
-  const views = { overview: vOverview, projects: vProjects, agents: vAgents, tasks: vTasks, templates: vTemplates, workflows: vWorkflows, activity: vActivity, integrate: vIntegrate, settings: vSettings };
+  // Chats: nur Liste, Kopf und Verlauf aktualisieren – das Eingabefeld bleibt unangetastet
+  if (ui.view === 'chats' && $('#chatComposer') && $('#chatComposer').dataset.agent === ui.chatAgent && agentById(ui.chatAgent)) {
+    updateChats(); if (ui.drawerTask) renderDrawer(); return;
+  }
+  const views = { overview: vOverview, projects: vProjects, chats: vChats, agents: vAgents, tasks: vTasks, templates: vTemplates, workflows: vWorkflows, activity: vActivity, integrate: vIntegrate, settings: vSettings };
   const ae = document.activeElement;
   if (ae && $('#view').contains(ae) && /INPUT|TEXTAREA|SELECT/.test(ae.tagName) && ae.id !== 'taskSearch') { if (ui.drawerTask) renderDrawer(); return; }
   const scroll = $('#view').scrollTop;
@@ -234,6 +247,9 @@ function vOverview() {
   const active = T.filter(t => t.status === 'running' || t.status === 'queued').sort((a, b) => b.createdAt - a.createdAt);
   let html = '';
   if (!A.length) html += onboarding();
+  const qs = openQuestionsToUser();
+  if (qs.length) html += `<div class="panel mb"><div class="panel-head"><h3>❓ Rückfragen an dich (${qs.length})</h3><button class="btn btn-sm btn-ghost" data-action="nav" data-view="chats">Chats →</button></div><div class="panel-body">
+    ${qs.slice(-5).map(m => `<div class="q-row"><b>${esc(partyLabel(m.from))}</b><span class="selectable">${esc(m.text)}</span>${m.taskId ? `<button class="btn btn-sm btn-ghost" data-action="task-open" data-id="${m.taskId}">Chat</button>` : ''}<button class="btn btn-sm btn-primary" data-action="msg-answer" data-id="${m.id}">Antworten</button></div>`).join('')}</div></div>`;
   html += `<div class="grid grid-kpi ${A.length ? '' : 'mt'}">
     ${kpi('Bereit', A.filter(a => a.status === 'waiting').length, 'zap', '#22d3ee', '0 Tokens im Wartezustand')}
     ${kpi('Arbeiten gerade', A.filter(a => a.status === 'working').length, 'bot', '#a78bfa', `${A.length} Agenten insgesamt`)}
@@ -296,7 +312,7 @@ function taskRow(t) {
   </div>`;
 }
 
-const EV_ICON = { 'project.created': '🗂️', 'project.planned': '📋', 'project.status': '🔄', 'project.part.approved': '🟢', 'project.part.accepted': '🏅', 'project.part.rework': '🔁', 'project.completed': '🏁', 'project.cancelled': '⛔', 'project.deleted': '🗑️', 'task.created': '📨', 'task.started': '⚡', 'task.completed': '✅', 'task.failed': '⚠️', 'task.progress': '📝', 'task.cancelled': '⛔', 'agent.registered': '👋', 'agent.waiting': '🟢', 'agent.offline': '💤', 'agent.removed': '🗑️', 'workflow.started': '🎼', 'workflow.completed': '🏁', 'workflow.failed': '💥', 'hub.started': '🚀' };
+const EV_ICON = { 'message.sent': '💬', 'message.question': '❓', 'message.answered': '✅', 'project.created': '🗂️', 'project.planned': '📋', 'project.status': '🔄', 'project.part.approved': '🟢', 'project.part.accepted': '🏅', 'project.part.rework': '🔁', 'project.completed': '🏁', 'project.cancelled': '⛔', 'project.deleted': '🗑️', 'task.created': '📨', 'task.started': '⚡', 'task.completed': '✅', 'task.failed': '⚠️', 'task.progress': '📝', 'task.cancelled': '⛔', 'agent.registered': '👋', 'agent.waiting': '🟢', 'agent.offline': '💤', 'agent.removed': '🗑️', 'workflow.started': '🎼', 'workflow.completed': '🏁', 'workflow.failed': '💥', 'hub.started': '🚀' };
 function feedItem(e) {
   const clickable = e.ref && (e.ref.startsWith('t_') || (e.ref.startsWith('pj_') && projById(e.ref)));
   return `<div class="feed-item ${clickable ? 'clickable' : ''}" ${clickable ? `data-action="${e.ref.startsWith('pj_') ? 'proj-open' : 'task-open'}" data-id="${e.ref}"` : ''}>
@@ -306,16 +322,19 @@ function feedItem(e) {
 /* ───────── Ansicht: Agenten ───────── */
 function vAgents() {
   if (!S.agents.length) return onboarding();
+  const chip = (m, l) => `<button class="chip ${ui.agentsMode === m ? 'active' : ''}" data-action="agents-mode" data-m="${m}">${l}</button>`;
+  const head = `<div class="filters">${chip('cards', 'Karten')}${chip('org', 'Organigramm')}</div>`;
+  if (ui.agentsMode === 'org') return head + orgChart();
   const order = { working: 0, waiting: 1, idle: 2, offline: 3 };
   const list = [...S.agents].sort((a, b) => (a.role === 'manager' ? -1 : 0) - (b.role === 'manager' ? -1 : 0) || order[a.status] - order[b.status] || a.name.localeCompare(b.name));
-  return `<div class="grid grid-cards">${list.map(agentCard).join('')}</div>`;
+  return head + `<div class="grid grid-cards">${list.map(agentCard).join('')}</div>`;
 }
 
 function agentCard(a) {
   const cur = (a.runningTasks || []).map(id => S.tasks.find(t => t.id === id)).filter(Boolean);
   return `<div class="panel agent-card st-${a.status}">
     <div class="agent-top">${avatar(a)}
-      <div style="min-width:0;flex:1"><div class="agent-name">${esc(a.name)}</div><div class="flex gap-s" style="margin-top:3px">${statusPill(a.status)}${a.role === 'manager' ? '<span class="pill manager">Manager</span>' : ''}</div></div>
+      <div style="min-width:0;flex:1"><div class="agent-name">${esc(a.name)}</div>${agentById(a.supervisorId) ? `<div class="faint" style="font-size:11.5px">untersteht ${esc(agentById(a.supervisorId).name)}</div>` : ''}<div class="flex gap-s" style="margin-top:3px">${statusPill(a.status)}${a.role === 'manager' ? '<span class="pill manager">Manager</span>' : ''}</div></div>
     </div>
     <div class="agent-desc">${esc(a.description) || '<span class="faint">Keine Beschreibung</span>'}</div>
     ${a.tags?.length ? `<div class="agent-meta">${a.tags.map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div>` : ''}
@@ -326,6 +345,7 @@ function agentCard(a) {
     <div class="agent-stats"><span><b>${a.completed}</b> erledigt</span><span><b>${a.failed}</b> Fehler</span>${a.queuedForMe ? `<span><b>${a.queuedForMe}</b> in Warteschlange</span>` : ''}<span style="margin-left:auto">${ago(a.lastSeen)}</span></div>
     <div class="agent-actions">
       <button class="btn btn-sm" data-action="agent-send" data-id="${a.id}">${icon('send', 'sm')} Auftrag</button>
+      <button class="btn btn-sm" data-action="chat-open" data-id="${a.id}">${icon('chat', 'sm')} Chat</button>
       <button class="btn btn-sm" data-action="agent-role" data-id="${a.id}">${icon('crown', 'sm')} ${a.role === 'manager' ? 'Zum Worker' : 'Zum Manager'}</button>
       <button class="btn btn-sm btn-icon" data-action="agent-edit" data-id="${a.id}" title="Bearbeiten">${icon('edit', 'sm')}</button>
       <button class="btn btn-sm btn-icon btn-danger" data-action="agent-del" data-id="${a.id}" title="Abmelden">${icon('trash', 'sm')}</button>
@@ -367,42 +387,86 @@ function kcard(t) {
   </div>`;
 }
 
-/* ───────── Drawer: Auftragsdetails ───────── */
-function openTask(id) { ui.drawerTask = id; renderDrawer(); $('#drawer').classList.add('open'); }
-function closeDrawer() { ui.drawerTask = null; $('#drawer').classList.remove('open'); }
-function renderDrawer() {
-  const t = S.tasks.find(x => x.id === ui.drawerTask);
-  if (!t) { closeDrawer(); return; }
-  const a = agentById(t.assignedAgentId);
-  const children = S.tasks.filter(x => x.parentId === t.id && x.id !== t.id);
-  const parent = t.parentId ? S.tasks.find(x => x.id === t.parentId) : null;
-  $('#drawer').innerHTML = `
-    <div class="drawer-head"><div class="flex between">${taskPill(t.status)}<div class="flex gap-s">
-      ${t.status === 'queued' || t.status === 'running' ? `<button class="btn btn-sm" data-action="task-cancel" data-id="${t.id}">${icon('stop', 'sm')} Abbrechen</button>` : `<button class="btn btn-sm" data-action="task-retry" data-id="${t.id}">${icon('refresh', 'sm')} Erneut</button>`}
+/* ───────── Drawer: Auftrag als Chat ───────── */
+function openTask(id) {
+  ui.drawerTask = id; ui.drawerTab = 'chat';
+  $('#drawer').dataset.key = '';
+  renderDrawer(true);
+  $('#drawer').classList.add('open');
+}
+function closeDrawer() { ui.drawerTask = null; $('#drawer').classList.remove('open'); $('#drawer').dataset.key = ''; }
+function drawerHeadHtml(t) {
+  const nMsg = (S.messages || []).filter(m => m.taskId === t.id || m.viaTaskId === t.id).length + (t.progress || []).length;
+  const tab = (id, label) => `<button class="tab ${ui.drawerTab === id ? 'active' : ''}" data-action="drawer-tab" data-tab="${id}">${label}</button>`;
+  return `<div class="flex between">${taskPill(t.status)}<div class="flex gap-s">
+      ${t.status === 'queued' || t.status === 'running' ? `<button class="btn btn-sm btn-danger" data-action="task-cancel" data-id="${t.id}">${icon('stop', 'sm')} Abbrechen</button>` : `<button class="btn btn-sm" data-action="task-retry" data-id="${t.id}">${icon('refresh', 'sm')} Erneut</button>`}
       <button class="btn btn-sm btn-icon" data-action="task-dup" data-id="${t.id}" title="Als neuen Auftrag">${icon('copy', 'sm')}</button>
       <button class="btn btn-sm btn-icon btn-danger" data-action="task-del" data-id="${t.id}" title="Löschen">${icon('trash', 'sm')}</button>
       <button class="btn btn-sm btn-icon btn-ghost" data-action="drawer-close">${icon('x', 'sm')}</button></div></div>
-      <h2 class="selectable">${esc(t.title)}</h2></div>
-    <div class="drawer-body">
-      <dl class="kv">
-        <dt>Ziel</dt><dd>${esc(targetLabel(t.target))}</dd>
-        <dt>Agent</dt><dd>${a ? `<span class="flex gap-s">${avatar(a, 'sm')}${esc(a.name)}</span>` : '<span class="faint">noch nicht zugewiesen</span>'}</dd>
-        <dt>Von</dt><dd>${esc(creatorLabel(t.createdBy))}</dd>
-        <dt>Erstellt</dt><dd>${ago(t.createdAt)}</dd>
-        <dt>Dauer</dt><dd>${t.startedAt ? dur(t.startedAt, t.finishedAt) : '–'}</dd>
-        <dt>ID</dt><dd class="mono selectable">${t.id}</dd>
-        ${t.projectId && projById(t.projectId) ? `<dt>Projekt</dt><dd class="clickable" data-action="proj-open" data-id="${t.projectId}"><a>${esc(projById(t.projectId).name)}</a></dd>` : ''}
-        ${parent ? `<dt>Gehört zu</dt><dd class="clickable" data-action="task-open" data-id="${parent.id}"><a>${esc(parent.title)}</a></dd>` : ''}
-      </dl>
-      ${t.result ? `<div class="block-title flex between">Ergebnis <button class="btn btn-sm btn-ghost" data-action="copy" data-text="${esc(t.result)}">${icon('copy', 'sm')}</button></div><div class="result selectable">${esc(t.result)}</div>` : ''}
-      ${t.error ? `<div class="block-title">Fehler</div><div class="result err selectable">${esc(t.error)}</div>` : ''}
-      ${t.progress?.length ? `<div class="block-title">Verlauf</div><div class="timeline">${t.progress.map(p => `<div><small>${ago(p.time)}</small>${esc(p.text)}</div>`).join('')}</div>` : ''}
-      ${children.length ? `<div class="block-title">Teilaufträge (${children.length})</div>${children.map(taskRow).join('')}` : ''}
-      <div class="block-title flex between">Prompt <button class="btn btn-sm btn-ghost" data-action="copy" data-text="${esc(t.prompt)}">${icon('copy', 'sm')}</button></div>
-      <div class="code selectable">${esc(t.prompt)}</div>
-      <div class="block-title">Per curl</div>
-      <div class="code">${esc(`curl -s ${BASE}/api/tasks/${t.id}`)}</div>
-    </div>`;
+    <h2 class="selectable">${esc(t.title)}</h2>
+    <div class="tabs" style="margin-top:12px">${tab('chat', `💬 Chat${nMsg ? ` <span class="faint">${nMsg}</span>` : ''}`)}${tab('live', '🖥️ Live')}${t.docPath || t.docFile ? tab('doc', '📄 Beschreibung') : ''}${tab('details', 'ℹ️ Details')}</div>`;
+}
+function taskDetailsHtml(t) {
+  const a = agentById(t.assignedAgentId);
+  const children = S.tasks.filter(x => x.parentId === t.id && x.id !== t.id);
+  const parent = t.parentId ? S.tasks.find(x => x.id === t.parentId) : null;
+  return `<dl class="kv">
+      <dt>Ziel</dt><dd>${esc(targetLabel(t.target))}</dd>
+      <dt>Agent</dt><dd>${a ? `<span class="flex gap-s clickable" data-action="chat-open" data-id="${a.id}">${avatar(a, 'sm')}${esc(a.name)}</span>` : '<span class="faint">noch nicht zugewiesen</span>'}</dd>
+      <dt>Von</dt><dd>${esc(creatorLabel(t.createdBy))}</dd>
+      <dt>Erstellt</dt><dd>${ago(t.createdAt)}</dd>
+      <dt>Dauer</dt><dd>${t.startedAt ? dur(t.startedAt, t.finishedAt) : '–'}</dd>
+      <dt>ID</dt><dd class="mono selectable">${t.id}</dd>
+      ${t.docFile ? `<dt>Beschreibung</dt><dd class="mono selectable" style="font-size:12px;word-break:break-all">${esc(t.docFile)}</dd>` : ''}
+      ${t.projectId && projById(t.projectId) ? `<dt>Projekt</dt><dd class="clickable" data-action="proj-open" data-id="${t.projectId}"><a>${esc(projById(t.projectId).name)}</a></dd>` : ''}
+      ${parent ? `<dt>Gehört zu</dt><dd class="clickable" data-action="task-open" data-id="${parent.id}"><a>${esc(parent.title)}</a></dd>` : ''}
+    </dl>
+    ${t.result ? `<div class="block-title flex between">Ergebnis <button class="btn btn-sm btn-ghost" data-action="copy" data-text="${esc(t.result)}">${icon('copy', 'sm')}</button></div><div class="result selectable">${esc(t.result)}</div>` : ''}
+    ${t.error ? `<div class="block-title">Fehler</div><div class="result err selectable">${esc(t.error)}</div>` : ''}
+    ${children.length ? `<div class="block-title">Teilaufträge (${children.length})</div>${children.map(taskRow).join('')}` : ''}
+    <div class="block-title flex between">Prompt <button class="btn btn-sm btn-ghost" data-action="copy" data-text="${esc(t.prompt)}">${icon('copy', 'sm')}</button></div>
+    <div class="code selectable">${esc(t.prompt)}</div>
+    <div class="block-title">Per curl</div>
+    <div class="code">${esc(`curl -s ${BASE}/api/tasks/${t.id}`)}</div>`;
+}
+function taskComposerHtml(t) {
+  const a = agentById(t.assignedAgentId);
+  const mgr = agentById(taskManagerRef(t));
+  const done = !['queued', 'running'].includes(t.status);
+  return `<div class="composer" id="drawerComposer">
+    <textarea class="textarea" id="chatText" placeholder="${done ? 'Nachfrage' : 'Nachricht'} an ${esc(a?.name || 'den Agenten')} … (⌘↵ senden)"></textarea>
+    <div class="composer-row">
+      <select class="select sm" id="chatTo" style="min-width:0"><option value="agent">An ${esc(a?.name || 'Agent des Auftrags')} (direkt)</option>${mgr ? `<option value="manager">An Manager ${esc(mgr.name)} (Ergänzung – er verteilt)</option>` : ''}</select>
+      <label class="chk" title="Der Agent hält beim nächsten Kontakt sofort an und liest die Nachricht zuerst"><input type="checkbox" id="chatUrgent"> ⛔ Unterbrechen</label>
+      <button class="btn btn-sm btn-primary" style="margin-left:auto" data-action="chat-send-task" data-id="${t.id}">${icon('send', 'sm')} Senden</button>
+    </div></div>`;
+}
+function renderDrawer(force) {
+  const t = S.tasks.find(x => x.id === ui.drawerTask);
+  if (!t) { closeDrawer(); return; }
+  const d = $('#drawer');
+  const key = t.id + ':' + ui.drawerTab;
+  const full = force || d.dataset.key !== key || !$('#drawerBody');
+  if (full) {
+    d.innerHTML = `<div class="drawer-head" id="drawerHead"></div><div class="drawer-body scroll-host" id="drawerBody"></div>${ui.drawerTab === 'chat' ? taskComposerHtml(t) : ''}`;
+    d.dataset.key = key;
+  }
+  $('#drawerHead').innerHTML = drawerHeadHtml(t);
+  const b = $('#drawerBody');
+  const near = b.scrollHeight - b.scrollTop - b.clientHeight < 80, prev = b.scrollTop;
+  if (ui.drawerTab === 'live') {
+    if (full) {
+      const a = agentById(t.assignedAgentId);
+      b.innerHTML = a ? `<div class="banner info" style="font-size:12.5px">Live aus der Claude-Code-Sitzung von <b>${esc(a.name)}</b>${t.startedAt ? ' – ab Beginn dieses Auftrags' : ''}. Aktualisiert sich alle 3 s.</div><div id="liveBox">${liveHtml()}</div>`
+        : '<div class="banner info">Noch kein Agent zugewiesen.</div>';
+      if (a) startLive(a.id, t.startedAt ? t.startedAt - 5000 : null);
+    }
+    return;
+  }
+  if (ui.drawerTab === 'doc') b.innerHTML = docHtml(t);
+  else if (ui.drawerTab === 'details') b.innerHTML = taskDetailsHtml(t);
+  else b.innerHTML = `<div class="chat">${taskTimeline(t)}</div>`;
+  b.scrollTop = ui.drawerTab === 'chat' && (full || near) ? b.scrollHeight : prev;
 }
 
 /* ───────── Ansicht: Vorlagen ───────── */
@@ -523,6 +587,8 @@ function vSettings() {
     ${st.lanAccess && !st.apiKey ? '<div class="banner">Netzwerkzugriff ist aktiv, aber ohne API-Key – jeder im WLAN kann Aufträge erteilen.</div>' : ''}
     <div class="setting"><div class="txt"><b>Mitteilungen</b><span>macOS-Mitteilung, wenn ein Agent einen Auftrag abschließt.</span></div>
       <label class="switch"><input type="checkbox" data-action="set-notify" ${st.notifications ? 'checked' : ''}><span></span></label></div>
+    <div class="setting"><div class="txt"><b>Beschreibungsdateien</b><span>Agenten führen zu jedem Auftrag eine präzise Datei <span class="mono">.dirigent/…md</span> (wie eine README) – mit dem Auftrag wörtlich und allen Ergänzungen. Für Projekt-Teilbereiche immer an.</span></div>
+      <label class="switch"><input type="checkbox" data-action="set-docs" ${st.docFiles === false ? '' : 'checked'}><span></span></label></div>
     <div class="setting"><div class="txt"><b>Erscheinungsbild</b><span>Hell, dunkel oder wie das System.</span></div>
       <select class="select" id="setTheme" style="width:150px"><option value="">System</option><option value="dark">Dunkel</option><option value="light">Hell</option></select></div>
     <div class="setting"><div class="txt"><b>Daten</b><span class="mono">${esc(sv.dataPath || '')}</span></div>
@@ -587,7 +653,7 @@ function projCard(p) {
   const att = projAttention(p);
   const pct = total ? Math.round(acc / total * 100) : 0;
   return `<div class="panel proj-card clickable" data-action="proj-open" data-id="${p.id}">
-    <div class="flex between"><div class="proj-name">${esc(p.name)}</div>${projPill(p.status)}</div>
+    <div class="flex between"><div class="proj-name">${p.parentProjectId ? '<span class="tag">Unterprojekt</span> ' : ''}${esc(p.name)}</div>${projPill(p.status)}</div>
     <div class="muted proj-goal">${esc(p.goal)}</div>
     <div class="flex gap-s faint" style="font-size:12px">${mgr ? avatar(mgr, 'sm') + esc(mgr.name) : '👑 –'}<span>· ${p.standards.length} Standards · ${total} Teilbereiche</span></div>
     <div class="flex"><div class="progress" style="max-width:none"><i style="width:${pct}%"></i></div><span class="faint nowrap" style="font-size:12px">${acc}/${total}</span></div>
@@ -661,6 +727,7 @@ function projDetail(p) {
         <button class="btn btn-sm btn-icon btn-danger" data-action="proj-del" data-id="${p.id}" title="Löschen">${icon('trash', 'sm')}</button>
       </div>
     </div>
+    ${p.parentProjectId && projById(p.parentProjectId) ? `<div class="faint" style="font-size:12.5px">↑ Unterprojekt von <a class="clickable" data-action="proj-open" data-id="${p.parentProjectId}">${esc(projById(p.parentProjectId).name)}</a></div>` : ''}
     <h2 class="proj-title selectable">${esc(p.name)} ${projPill(p.status)}</h2>
     <div class="proj-goal-full selectable">${esc(p.goal)}</div>
     <div class="proj-meta">
@@ -681,12 +748,23 @@ function projDetail(p) {
       ${partsHtml}
     </div>
     <div class="flex" style="flex-direction:column;align-items:stretch;gap:16px">
+      ${live && agentById(p.managerId) ? `<div class="panel"><div class="panel-head"><h3>${icon('chat', 'sm')} Ergänzung an den Manager</h3></div><div class="panel-body">
+        <textarea class="textarea" id="pjSupp" style="min-height:80px" placeholder="Was soll noch rein oder anders werden? ${esc(agentById(p.managerId).name)} zerlegt es und ordnet es den Agenten zu (⌘↵)."></textarea>
+        <div class="composer-row" style="margin-top:8px"><label class="chk"><input type="checkbox" id="pjSuppUrgent"> ⛔ dringend</label>
+        <button class="btn btn-sm btn-primary" style="margin-left:auto" data-action="proj-supplement" data-id="${p.id}">${icon('send', 'sm')} An Manager</button></div>
+        ${projMessages(p)}</div></div>` : ''}
       ${standardsPanel(p)}
       ${p.summary ? `<div class="panel"><div class="panel-head"><h3>${icon('flow', 'sm')} Architektur & Plan</h3></div><div class="panel-body selectable" style="white-space:pre-wrap;font-size:13px;color:var(--text-2)">${esc(p.summary)}</div></div>` : ''}
       <div class="panel"><div class="panel-head"><h3>${icon('pulse', 'sm')} Verlauf</h3></div><div class="panel-body" style="max-height:420px;overflow:auto">
         ${tail.length ? `<div class="timeline">${tail.map(e => `<div><small>${ago(e.time)}</small>${esc(e.text)}</div>`).join('')}</div>` : '<div class="faint">Noch nichts passiert.</div>'}</div></div>
     </div>
   </div>`;
+}
+
+function projMessages(p) {
+  const list = (S.messages || []).filter(m => m.projectId === p.id).slice(-8);
+  if (!list.length) return '';
+  return `<div class="block-title">Kommunikation</div><div class="chat compact">${list.map(m => msgBubble(m, p.managerId)).join('')}</div>`;
 }
 
 function assignOptions(x) {
@@ -716,7 +794,8 @@ function partCard(p, x) {
     if (x.status === 'failed' || x.status === 'cancelled') btns.push(b('part-rework', 'Nacharbeit', '', 'refresh'), b('part-accept', 'Trotzdem abnehmen'), del);
     if (x.status === 'accepted') btns.push(b('part-rework', 'Nacharbeit', 'btn-ghost', 'refresh'));
   }
-  if (task) btns.push(`<button class="btn btn-sm btn-ghost" data-action="task-open" data-id="${task.id}">Auftrag →</button>`);
+  if (x.childProjectId && projById(x.childProjectId)) btns.push(`<button class="btn btn-sm" data-action="proj-open" data-id="${x.childProjectId}">${icon('layers', 'sm')} Unterprojekt →</button>`);
+  if (task) btns.push(`<button class="btn btn-sm btn-ghost" data-action="task-open" data-id="${task.id}">${icon('chat', 'sm')} Chat</button>`);
   const blockers = x.status === 'waiting' ? deps.filter(d => d.status !== 'accepted') : [];
   const lastProg = task?.status === 'running' && task.progress?.length ? task.progress[task.progress.length - 1].text : '';
   return `<div class="part-card ps-${x.status}">
@@ -910,6 +989,268 @@ const projActions = {
   },
 };
 
+/* ───────── Chats, Live-Protokoll, Beschreibungsdatei ─────────
+   Jeder Auftrag und jeder Agent hat einen Chat: Auftrag, Zwischenstände, Rückfragen, Antworten, Nachrichten, Ergebnis.
+   „Live“ liest die Claude-Code-Sitzung des Agenten mit (Texte, Befehle, Ausgaben). */
+const KIND_LABEL = { question: '❓ Rückfrage', answer: '💬 Antwort', supplement: '➕ Ergänzung', system: '⚙️ Hinweis', message: '💬 Nachricht' };
+const openQuestionsToUser = () => (S.messages || []).filter(m => m.kind === 'question' && m.to === 'user' && m.status !== 'answered');
+function partyLabel(ref) {
+  if (!ref || ref === 'user') return 'Du';
+  if (ref === 'system') return 'Dirigent';
+  if (ref === 'task') return 'Agent des Auftrags';
+  if (ref.startsWith('agent:')) return agentById(ref.slice(6))?.name || ref.slice(6);
+  return ref;
+}
+function bubble({ side, who, agent, time, badge = '', text, extra = '', cls = '' }) {
+  if (side === 'center') return `<div class="msg center ${cls}"><span>${esc(text)}</span><em>${ago(time)}</em></div>`;
+  const av = agent ? avatar(agent, 'sm') : `<div class="avatar sm" style="--ac:${who === 'Du' ? '#6366f1' : '#64748b'}">${esc(initials(who))}</div>`;
+  return `<div class="msg ${side} ${cls}"><div class="msg-av">${av}</div><div class="msg-b">
+    <div class="msg-h"><b>${esc(who)}</b>${badge ? `<span class="msg-badge">${badge}</span>` : ''}<span class="msg-time">${ago(time)}</span></div>
+    <div class="msg-t selectable">${esc(text)}</div>${extra}</div></div>`;
+}
+function msgBubble(m, selfAgentId) {
+  const fromAgent = m.from.startsWith('agent:') ? agentById(m.from.slice(6)) : null;
+  const side = m.from === 'system' ? 'center' : (fromAgent && fromAgent.id === selfAgentId ? 'left' : 'right');
+  if (side === 'center') return bubble({ side, time: m.time, text: `⚙️ ${m.text}`, cls: m.urgent ? 'urgent' : '' });
+  let badge = `${m.urgent ? '⛔ ' : ''}${KIND_LABEL[m.kind] || '💬'} → ${esc(partyLabel(m.to))}`;
+  let extra = '';
+  if (m.status === 'pending') extra += `<div class="msg-foot">⏳ wird beim nächsten Kontakt zugestellt (Zwischenstand, Rückfrage oder neuer Auftrag)</div>`;
+  if (m.kind === 'question') {
+    if (m.status === 'answered') extra += `<div class="msg-ans"><b>Antwort:</b> ${esc(m.answer)}</div>`;
+    else extra += `<div class="msg-foot">${m.to === 'user' ? '<b>Wartet auf deine Antwort.</b>' : `Wartet auf ${esc(partyLabel(m.to))}.`}
+      <button class="btn btn-sm ${m.to === 'user' ? 'btn-primary' : ''}" data-action="msg-answer" data-id="${m.id}">Antworten</button>
+      ${m.to !== 'user' ? '' : `<button class="btn btn-sm btn-ghost" data-action="msg-escalate" data-id="${m.id}" title="An Vorgesetzten weiterleiten">↗︎</button>`}</div>`;
+  }
+  return bubble({ side, who: partyLabel(m.from), agent: fromAgent, time: m.time, badge, text: m.text, extra, cls: m.urgent ? 'urgent' : '' });
+}
+const sysLine = (text, time) => ({ time: time || 0, html: bubble({ side: 'center', time, text }) });
+
+function taskManagerRef(t) {
+  const self = t.assignedAgentId;
+  const ok = (id) => id && id !== self && agentById(id);
+  if (ok(t.notifyAgentId)) return t.notifyAgentId;
+  const p = t.projectId && projById(t.projectId);
+  if (p && ok(p.managerId)) return p.managerId;
+  if (t.createdBy?.startsWith('agent:') && ok(t.createdBy.slice(6))) return t.createdBy.slice(6);
+  const sup = agentById(self)?.supervisorId;
+  return ok(sup) ? sup : null;
+}
+
+function taskTimeline(t) {
+  const ag = agentById(t.assignedAgentId);
+  const items = [{ time: t.createdAt, html: bubble({ side: 'right', who: creatorLabel(t.createdBy), agent: t.createdBy?.startsWith('agent:') ? agentById(t.createdBy.slice(6)) : null, time: t.createdAt, badge: t.kind === 'task' ? '📨 Auftrag' : '📨 ' + (t.kind === 'message' ? 'Nachrichten' : 'Rückmeldung'), text: t.prompt, cls: 'prompt' }) }];
+  if (t.startedAt) items.push(sysLine(`▶︎ ${ag?.name || 'Agent'} hat übernommen`, t.startedAt));
+  (t.progress || []).filter(p => !/^(❓ Rückfrage an|💬 Antwort von)/.test(p.text))
+    .forEach(p => items.push({ time: p.time, html: bubble({ side: 'left', who: ag?.name || 'Agent', agent: ag, time: p.time, badge: '📝 Zwischenstand', text: p.text }) }));
+  (S.messages || []).filter(m => m.taskId === t.id || m.viaTaskId === t.id).forEach(m => items.push({ time: m.time, html: msgBubble(m, t.assignedAgentId) }));
+  if (t.finishedAt && (t.result || t.error)) items.push({ time: t.finishedAt, html: bubble({ side: 'left', who: ag?.name || 'Agent', agent: ag, time: t.finishedAt, badge: t.error ? '⚠️ Fehler' : '✅ Ergebnis', text: t.result || t.error, cls: t.error ? 'err' : 'done' }) });
+  if (t.status === 'cancelled') items.push(sysLine('⛔ Auftrag abgebrochen', t.finishedAt || Date.now()));
+  if (t.status === 'running') items.push({ time: Date.now() + 1, html: `<div class="msg center typing"><span><i></i><i></i><i></i> ${esc(ag?.name || 'Agent')} arbeitet …</span></div>` });
+  return items.sort((a, b) => a.time - b.time).map(i => i.html).join('');
+}
+
+function agentTimeline(a) {
+  const ref = 'agent:' + a.id;
+  const items = [];
+  (S.messages || []).filter(m => m.from === ref || m.to === ref).forEach(m => items.push({ time: m.time, html: msgBubble(m, a.id) }));
+  S.tasks.filter(t => t.assignedAgentId === a.id && t.kind !== 'message').slice(-25).forEach(t => {
+    items.push({ time: t.startedAt || t.createdAt, html: bubble({ side: 'right', who: creatorLabel(t.createdBy), time: t.startedAt || t.createdAt, badge: `📨 ${esc(t.title)}`, text: t.prompt.length > 900 ? t.prompt.slice(0, 900) + ' …' : t.prompt, cls: 'prompt', extra: `<div class="msg-foot"><button class="btn btn-sm btn-ghost" data-action="task-open" data-id="${t.id}">Auftrags-Chat →</button></div>` }) });
+    if (t.status === 'running') (t.progress || []).slice(-5).forEach(p => items.push({ time: p.time, html: bubble({ side: 'left', who: a.name, agent: a, time: p.time, badge: '📝 Zwischenstand', text: p.text }) }));
+    if (t.finishedAt && (t.result || t.error)) items.push({ time: t.finishedAt, html: bubble({ side: 'left', who: a.name, agent: a, time: t.finishedAt, badge: t.error ? '⚠️ Fehler' : '✅ Ergebnis', text: t.result || t.error, cls: t.error ? 'err' : 'done' }) });
+  });
+  if (a.status === 'working') items.push({ time: Date.now() + 1, html: `<div class="msg center typing"><span><i></i><i></i><i></i> ${esc(a.name)} arbeitet …</span></div>` });
+  return items.sort((x, y) => x.time - y.time).slice(-200).map(i => i.html).join('') || '<div class="faint" style="text-align:center;padding:30px">Noch keine Unterhaltung.</div>';
+}
+
+/* Live-Protokoll */
+const LIVE = { key: null, agentId: null, since: null, entries: [], found: null, hint: '', timer: null, loading: false };
+function liveHtml() {
+  if (LIVE.found === null) return '<div class="faint" style="padding:20px">Lade Protokoll …</div>';
+  if (!LIVE.found) return `<div class="banner info">${esc(LIVE.hint || 'Keine Sitzung gefunden.')}</div>`;
+  if (!LIVE.entries.length) return '<div class="faint" style="padding:20px">Noch keine Einträge in diesem Zeitraum.</div>';
+  return LIVE.entries.map(e => {
+    if (e.kind === 'text') return `<div class="lv lv-text"><div class="lv-h">🤖 Claude <span>${ago(e.time)}</span></div><div class="selectable">${esc(e.text)}</div></div>`;
+    if (e.kind === 'tool') return `<div class="lv lv-tool"><div class="lv-h">⚙︎ ${esc(e.name)}${e.desc ? ` · <span class="muted">${esc(e.desc)}</span>` : ''} <span>${ago(e.time)}</span></div><pre class="selectable">${esc(e.text)}</pre></div>`;
+    if (e.kind === 'result') return `<div class="lv lv-result ${e.error ? 'err' : ''}"><pre class="selectable">${esc(e.text || '(keine Ausgabe)')}</pre></div>`;
+    return `<div class="lv lv-prompt"><div class="lv-h">👤 Eingabe <span>${ago(e.time)}</span></div><pre class="selectable">${esc(e.text)}</pre></div>`;
+  }).join('');
+}
+function startLive(agentId, since) {
+  const key = agentId + ':' + (since || 0);
+  if (LIVE.key !== key) { Object.assign(LIVE, { key, agentId, since, entries: [], found: null, hint: '' }); }
+  clearInterval(LIVE.timer);
+  const tick = async () => {
+    const box = $('#liveBox');
+    if (!box) { clearInterval(LIVE.timer); LIVE.timer = null; return; }
+    if (LIVE.loading) return;
+    LIVE.loading = true;
+    try {
+      const r = await api('GET', `/api/agents/${agentId}/transcript?limit=400${since ? `&since=${Math.floor(since)}` : ''}`);
+      if (LIVE.key !== key) return;
+      LIVE.found = !!r.found; LIVE.hint = r.hint || r.error || ''; LIVE.entries = r.entries || [];
+      const b = $('#liveBox'); if (!b) return;
+      const sc = b.closest('.scroll-host') || b.parentElement;
+      const nearBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80;
+      b.innerHTML = liveHtml();
+      if (nearBottom) sc.scrollTop = sc.scrollHeight;
+    } catch (e) { LIVE.found = false; LIVE.hint = e.message; const b = $('#liveBox'); if (b) b.innerHTML = liveHtml(); }
+    finally { LIVE.loading = false; }
+  };
+  tick();
+  LIVE.timer = setInterval(tick, 3000);
+}
+
+/* Beschreibungsdatei */
+const DOCS = {};
+async function loadDoc(taskId) {
+  try { const r = await api('GET', `/api/tasks/${taskId}/doc?format=json`); DOCS[taskId] = { path: r.path, content: r.content }; }
+  catch (e) { DOCS[taskId] = { error: e.message }; }
+  if (ui.drawerTask === taskId && ui.drawerTab === 'doc') renderDrawer();
+}
+function docHtml(t) {
+  if (!t.docPath && !t.docFile) return `<div class="banner info">Für diesen Auftrag wird keine Beschreibungsdatei geführt.</div>`;
+  const d = DOCS[t.id];
+  if (!d) { loadDoc(t.id); return '<div class="faint">Lade Beschreibungsdatei …</div>'; }
+  if (d.error) return `<div class="banner info">${esc(d.error)}</div><button class="btn btn-sm" data-action="doc-reload" data-id="${t.id}">${icon('refresh', 'sm')} Neu laden</button>`;
+  return `<div class="flex between mb"><span class="mono faint" style="font-size:12px;word-break:break-all">${esc(d.path)}</span><div class="flex gap-s">
+      <button class="btn btn-sm" data-action="doc-reload" data-id="${t.id}">${icon('refresh', 'sm')}</button>
+      <button class="btn btn-sm" data-action="copy" data-text="${esc(d.path)}">${icon('copy', 'sm')} Pfad</button>
+      ${window.DIRIGENT_NATIVE ? `<button class="btn btn-sm" data-action="reveal" data-path="${esc(d.path)}">${icon('folder', 'sm')} Finder</button>` : ''}</div></div>
+    <div class="md selectable">${mdLite(d.content)}</div>`;
+}
+/** Minimaler Markdown-Renderer (Überschriften, Listen, Code, Zitate, fett/kursiv, Inline-Code). */
+function mdLite(src) {
+  const lines = String(src || '').split('\n');
+  let out = '', inCode = false, fence = '', list = false;
+  const inline = (s) => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/(^|[^*])\*([^*]+)\*/g, '$1<i>$2</i>').replace(/_\(([^)]+)\)_/g, '<i class="faint">($1)</i>');
+  for (const l of lines) {
+    const f = l.match(/^(```+|~~~+)/);
+    if (f) { if (!inCode) { inCode = true; fence = f[1]; out += '<pre>'; } else if (l.startsWith(fence)) { inCode = false; out += '</pre>'; } else out += esc(l) + '\n'; continue; }
+    if (inCode) { out += esc(l) + '\n'; continue; }
+    const li = l.match(/^\s*[-*•] (.*)/) || l.match(/^\s*\d+\. (.*)/);
+    if (li) { if (!list) { out += '<ul>'; list = true; } out += `<li>${inline(li[1])}</li>`; continue; }
+    if (list) { out += '</ul>'; list = false; }
+    const h = l.match(/^(#{1,4}) (.*)/);
+    if (h) out += `<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`;
+    else if (l.startsWith('> ')) out += `<blockquote>${inline(l.slice(2))}</blockquote>`;
+    else if (/^---+$/.test(l.trim())) out += '<hr>';
+    else if (l.trim()) out += `<p>${inline(l)}</p>`;
+  }
+  if (inCode) out += '</pre>'; if (list) out += '</ul>';
+  return out;
+}
+
+/* Ansicht: Chats */
+function chatAgentRow(a) {
+  const ref = 'agent:' + a.id;
+  const open = openQuestionsToUser().filter(m => m.from === ref).length;
+  const last = (S.messages || []).filter(m => m.from === ref || m.to === ref).slice(-1)[0];
+  const cur = a.runningTasks?.length ? S.tasks.find(t => t.id === a.runningTasks[0]) : null;
+  const sub = open ? `❓ ${open} Rückfrage${open > 1 ? 'n' : ''} an dich` : (cur ? '⚡ ' + cur.title : (last ? last.text : STATUS[a.status]));
+  const depth = (() => { let d = 0, c = a; while (c?.supervisorId && d < 6) { c = agentById(c.supervisorId); if (!c) break; d++; } return d; })();
+  return `<div class="chat-row ${ui.chatAgent === a.id ? 'active' : ''} st-${a.status}" data-action="chat-open" data-id="${a.id}" style="padding-left:${10 + depth * 14}px">
+    ${avatar(a, 'sm')}<div class="txt"><div class="nm">${esc(a.name)} ${a.role === 'manager' ? '👑' : ''}</div><div class="sub">${esc(sub)}</div></div>
+    ${open ? `<span class="count live">${open}</span>` : `<span class="dot ${a.status}"></span>`}</div>`;
+}
+function orderedAgents() {
+  const out = [], seen = new Set();
+  const walk = (a) => { if (seen.has(a.id)) return; seen.add(a.id); out.push(a); S.agents.filter(x => x.supervisorId === a.id).sort((x, y) => (x.role === 'manager' ? -1 : 1) - (y.role === 'manager' ? -1 : 1) || x.name.localeCompare(y.name)).forEach(walk); };
+  S.agents.filter(a => !a.supervisorId || !agentById(a.supervisorId)).sort((x, y) => (x.role === 'manager' ? -1 : 1) - (y.role === 'manager' ? -1 : 1) || x.name.localeCompare(y.name)).forEach(walk);
+  S.agents.forEach(walk);
+  return out;
+}
+function chatListHtml() {
+  const qs = openQuestionsToUser();
+  return (qs.length ? `<div class="chat-sec">❓ Offene Rückfragen an dich</div>${qs.map(m => `<div class="chat-q" data-action="msg-answer" data-id="${m.id}"><b>${esc(partyLabel(m.from))}</b><span>${esc(m.text)}</span></div>`).join('')}` : '')
+    + `<div class="chat-sec">Agenten</div>${orderedAgents().map(chatAgentRow).join('') || '<div class="faint" style="padding:10px">Noch keine Agenten.</div>'}`;
+}
+function chatHeadHtml(a) {
+  const cur = a.runningTasks?.length ? S.tasks.find(t => t.id === a.runningTasks[0]) : null;
+  const sup = agentById(a.supervisorId);
+  return `<div class="flex" style="min-width:0">${avatar(a)}<div style="min-width:0"><div class="agent-name">${esc(a.name)} ${a.role === 'manager' ? '👑' : ''}</div>
+      <div class="flex gap-s" style="font-size:12px">${statusPill(a.status)}${sup ? `<span class="faint">untersteht ${esc(sup.name)}</span>` : ''}${cur ? `<a class="clickable faint nowrap" data-action="task-open" data-id="${cur.id}" style="overflow:hidden;text-overflow:ellipsis">⚡ ${esc(cur.title)}</a>` : ''}</div></div></div>
+    <div class="tabs"><button class="tab ${ui.chatTab !== 'live' ? 'active' : ''}" data-action="chat-tab" data-tab="chat">💬 Chat</button><button class="tab ${ui.chatTab === 'live' ? 'active' : ''}" data-action="chat-tab" data-tab="live">🖥️ Live</button></div>`;
+}
+function vChats() {
+  if (!S.agents.length) return onboarding();
+  if (!ui.chatAgent || !agentById(ui.chatAgent)) ui.chatAgent = orderedAgents()[0]?.id;
+  const a = agentById(ui.chatAgent);
+  const cur = a.runningTasks?.length ? S.tasks.find(t => t.id === a.runningTasks[0]) : null;
+  setTimeout(() => { const b = $('#chatBody'); if (b) b.scrollTop = b.scrollHeight; if (ui.chatTab === 'live') startLive(a.id, null); }, 0);
+  return `<div class="chat-wrap">
+    <div class="panel chat-list" id="chatList">${chatListHtml()}</div>
+    <div class="panel chat-main">
+      <div class="chat-head" id="chatHead">${chatHeadHtml(a)}</div>
+      <div class="chat-body scroll-host" id="chatBody">${ui.chatTab === 'live' ? `<div id="liveBox">${liveHtml()}</div>` : `<div class="chat">${agentTimeline(a)}</div>`}</div>
+      <div class="composer" id="chatComposer" data-agent="${a.id}">
+        <textarea class="textarea" id="chatText" placeholder="Nachricht an ${esc(a.name)} … (⌘↵ senden)"></textarea>
+        <div class="composer-row">
+          ${cur ? `<label class="chk"><input type="checkbox" id="chatLink" checked> zu „${esc(cur.title.slice(0, 40))}“</label>` : ''}
+          <label class="chk" title="Der Agent hält beim nächsten Kontakt sofort an und liest die Nachricht zuerst"><input type="checkbox" id="chatUrgent"> ⛔ Unterbrechen</label>
+          <span class="faint" style="font-size:11.5px;margin-left:auto">${a.status === 'waiting' ? 'wird sofort zugestellt' : a.status === 'working' ? 'Zustellung beim nächsten Zwischenstand' : 'wird zugestellt, sobald der Agent bereit ist'}</span>
+          <button class="btn btn-sm btn-primary" data-action="chat-send-agent" data-id="${a.id}" data-task="${cur?.id || ''}">${icon('send', 'sm')} Senden</button>
+        </div>
+      </div>
+    </div></div>`;
+}
+function updateChats() {
+  const a = agentById(ui.chatAgent); if (!a) return false;
+  $('#chatList').innerHTML = chatListHtml();
+  $('#chatHead').innerHTML = chatHeadHtml(a);
+  if (ui.chatTab !== 'live') {
+    const b = $('#chatBody'); const near = b.scrollHeight - b.scrollTop - b.clientHeight < 80;
+    b.innerHTML = `<div class="chat">${agentTimeline(a)}</div>`;
+    if (near) b.scrollTop = b.scrollHeight;
+  }
+  return true;
+}
+
+/* Organigramm */
+function orgNode(a, depth = 0) {
+  const kids = S.agents.filter(x => x.supervisorId === a.id);
+  const cur = a.runningTasks?.length ? S.tasks.find(t => t.id === a.runningTasks[0]) : null;
+  return `<div class="org-node"><div class="org-card st-${a.status}" data-action="chat-open" data-id="${a.id}" title="Chat mit ${esc(a.name)}">
+      ${avatar(a, 'sm')}<div class="txt"><div class="nm">${esc(a.name)} ${a.role === 'manager' ? '👑' : ''}</div><div class="sub">${esc(cur ? '⚡ ' + cur.title : STATUS[a.status])}</div></div>
+      ${a.role === 'manager' && kids.length ? `<span class="tag">${kids.length} im Team</span>` : ''}<span class="dot ${a.status}"></span></div>
+    ${kids.length && depth < 8 ? `<div class="org-kids">${kids.map(k => orgNode(k, depth + 1)).join('')}</div>` : ''}</div>`;
+}
+function orgChart() {
+  const roots = S.agents.filter(a => !a.supervisorId || !agentById(a.supervisorId)).sort((x, y) => (x.role === 'manager' ? -1 : 1) - (y.role === 'manager' ? -1 : 1));
+  return `<div class="panel"><div class="panel-body">
+    <p class="muted" style="margin-top:0;font-size:13px">Baukasten: Jeder Agent kann einem Manager unterstehen – auch Manager einem Manager (Orchestrator über Orchestratoren). Rückfragen laufen die Kette hinauf, Aufträge an <span class="mono">team:&lt;manager&gt;</span> gehen an einen freien Agenten seines Teams. Zuordnen per ${icon('edit', 'sm')} auf der Agentenkarte.</p>
+    <div class="org">${roots.map(r => orgNode(r)).join('')}</div></div></div>`;
+}
+
+const chatActions = {
+  'chat-open': (el) => { closeDrawer(); ui.view = 'chats'; ui.chatAgent = el.dataset.id; ui.chatTab = 'chat'; try { localStorage.setItem('dirigent.view', 'chats'); } catch {} render(); },
+  'chat-tab': (el) => { ui.chatTab = el.dataset.tab; $('#chatComposer')?.removeAttribute('data-agent'); render(); },
+  'chat-send-agent': async (el) => {
+    const text = $('#chatText').value.trim(); if (!text) { $('#chatText').focus(); return; }
+    const body = { text, urgent: $('#chatUrgent').checked };
+    if (el.dataset.task && $('#chatLink')?.checked) body.task = el.dataset.task;
+    try { await api('POST', `/api/agents/${el.dataset.id}/messages?format=json`, body); $('#chatText').value = ''; toast('✉️', body.urgent ? 'Unterbrechung gesendet' : 'Nachricht gesendet'); refreshSoon(); } catch (e) { toast('⚠️', e.message); }
+  },
+  'chat-send-task': async (el) => {
+    const text = $('#chatText').value.trim(); if (!text) { $('#chatText').focus(); return; }
+    const to = $('#chatTo')?.value || 'agent';
+    try { await api('POST', `/api/tasks/${el.dataset.id}/message?format=json`, { text, urgent: $('#chatUrgent').checked, to }); $('#chatText').value = ''; toast('✉️', to === 'manager' ? 'Ergänzung an den Manager gesendet' : 'Nachricht gesendet'); refreshSoon(); } catch (e) { toast('⚠️', e.message); }
+  },
+  'msg-answer': (el) => {
+    const m = (S.messages || []).find(x => x.id === el.dataset.id); if (!m) return;
+    askModal({ title: `Rückfrage von ${partyLabel(m.from)}`, label: m.text.length > 300 ? m.text.slice(0, 300) + ' …' : m.text, ok: 'Antwort senden', required: true,
+      placeholder: 'Deine Antwort …', hint: 'Der Agent wird mit deiner Antwort geweckt bzw. erhält sie beim nächsten Kontakt.',
+      onOk: async (v) => { await api('POST', `/api/messages/${m.id}/answer`, { text: v }); toast('💬', 'Antwort gesendet'); } });
+  },
+  'msg-escalate': async (el) => { try { await api('POST', `/api/messages/${el.dataset.id}/escalate`, { note: '' }); toast('↗︎', 'Weitergeleitet'); } catch (e) { toast('⚠️', e.message); } },
+  'drawer-tab': (el) => { ui.drawerTab = el.dataset.tab; renderDrawer(true); },
+  'doc-reload': (el) => { delete DOCS[el.dataset.id]; renderDrawer(); },
+  'agents-mode': (el) => { ui.agentsMode = el.dataset.m; try { localStorage.setItem('dirigent.agentsMode', ui.agentsMode); } catch {} render(); },
+  'proj-supplement': async (el) => {
+    const text = $('#pjSupp').value.trim(); if (!text) { $('#pjSupp').focus(); return; }
+    try { await api('POST', `/api/projects/${el.dataset.id}/message?format=json`, { text, urgent: $('#pjSuppUrgent').checked, createdBy: 'user' }); $('#pjSupp').value = ''; $('#pjSupp').blur(); toast('➕', 'Ergänzung an den Manager gesendet – er verteilt sie'); } catch (e) { toast('⚠️', e.message); }
+  },
+};
+
 /* ───────── Modals ───────── */
 function modal(html, cls = '') {
   $('#modalRoot').innerHTML = `<div class="modal-back" data-action="modal-bg"><div class="modal ${cls}">${html}</div></div>`;
@@ -920,6 +1261,7 @@ const closeModal = () => { $('#modalRoot').innerHTML = ''; };
 function targetPicker(current = 'any', name = 'target') {
   const opts = [['any', '⚡ Beliebiger Worker'], ['manager', '👑 Manager'], ['all', '📣 Alle Worker'],
     ...S.agents.map(a => [`agent:${a.id}`, `${a.status === 'waiting' ? '🟢' : a.status === 'working' ? '🟣' : '⚪️'} ${a.name}`]),
+    ...S.agents.filter(a => S.agents.some(x => x.supervisorId === a.id)).map(a => [`team:${a.id}`, `👥 Team ${a.name}`]),
     ...[...new Set(S.agents.flatMap(a => a.tags || []))].map(t => [`tag:${t}`, `#${t}`])];
   if (current && !opts.some(o => o[0] === current)) opts.push([current, targetLabel(current)]);
   return `<div class="target-grid" data-picker="${name}">${opts.map(([v, l]) => `<button type="button" class="target-opt ${v === current ? 'active' : ''}" data-action="pick" data-v="${esc(v)}">${esc(l)}</button>`).join('')}</div>
@@ -934,6 +1276,7 @@ function composeModal(opts = {}) {
     <div class="field"><label>An</label>${targetPicker(opts.target || 'any', 'cTarget')}</div>
     <div class="row"><div class="field"><label>Titel (optional)</label><input class="input" id="cTitle" value="${esc(opts.title || '')}" placeholder="Wird sonst aus dem Prompt erzeugt"></div>
       <div class="field" style="max-width:140px"><label>Priorität</label><input class="input" id="cPrio" type="number" value="${esc(opts.priority || 0)}"></div></div>
+    <label class="chk" style="margin-bottom:12px"><input type="checkbox" id="cDoc" ${S.settings?.docFiles === false ? '' : 'checked'}> 📄 Beschreibungsdatei verlangen <span class="faint">(.dirigent/…md im Arbeitsordner – Auftrag wörtlich + ausführliche Doku des Agenten)</span></label>
     ${!S.agents.length ? '<div class="banner info">Noch kein Agent angemeldet – der Auftrag wartet in der Warteschlange, bis sich einer meldet.</div>' : ''}
   </div>
   <div class="modal-foot"><span class="faint" style="margin-right:auto;font-size:12px"><kbd>⌘</kbd> <kbd>↵</kbd> zum Senden</span><button class="btn" data-action="modal-close">Abbrechen</button><button class="btn btn-primary" data-action="compose-send">${icon('send', 'sm')} Senden</button></div>`);
@@ -943,7 +1286,7 @@ async function composeSend() {
   const prompt = $('#cPrompt').value.trim();
   if (!prompt) { $('#cPrompt').focus(); return; }
   try {
-    const r = await api('POST', '/api/tasks', { prompt, target: $('#cTarget').value, title: $('#cTitle').value, priority: +$('#cPrio').value || 0, createdBy: 'user' });
+    const r = await api('POST', '/api/tasks', { prompt, target: $('#cTarget').value, title: $('#cTitle').value, priority: +$('#cPrio').value || 0, createdBy: 'user', doc: $('#cDoc').checked });
     closeModal(); toast('📨', `${r.tasks.length > 1 ? r.tasks.length + ' Aufträge' : 'Auftrag'} gesendet → ${targetLabel($('#cTarget')?.value || r.tasks[0].target)}`);
   } catch (e) { toast('⚠️', e.message); }
 }
@@ -954,6 +1297,7 @@ function joinModal() {
     <p class="muted" style="margin-top:0">Füge einen dieser Sätze in Claude Code ein. Der Agent registriert sich, startet einen Warte-Befehl <b>im Hintergrund</b> und beendet seinen Zug – ab da verbraucht er <b>0 Tokens</b>, bis ein Auftrag kommt.</p>
     <div class="block-title">Worker</div>${codeBlock(joinPrompt())}
     <div class="block-title">Manager</div>${codeBlock(joinPrompt('manager'))}
+    <div class="block-title">Unter-Manager / Team-Mitglied (Baukasten)</div>${codeBlock(`Melde dich bei Dirigent als Agent "ios-dev" an, dein Vorgesetzter ist der Manager "app-lead". Anleitung: curl -s "${BASE}/join?name=ios-dev&supervisor=app-lead"`)}
     <div class="block-title">Mit Name & Tags</div>${codeBlock(`Melde dich bei Dirigent als Agent "frontend" mit den Tags web,react an und halte dich bereit. Anleitung: curl -s "${BASE}/join?name=frontend&tags=web,react"`)}
   </div><div class="modal-foot"><button class="btn btn-primary" data-action="modal-close">Fertig</button></div>`);
 }
@@ -1026,6 +1370,8 @@ function wfRunModal(id) {
   <div class="modal-foot"><button class="btn" data-action="modal-close">Abbrechen</button><button class="btn btn-primary" data-action="wf-go" data-id="${w.id}">${icon('play', 'sm')} Starten</button></div>`, 'wide');
 }
 
+/** Liegt `id` (direkt oder indirekt) unterhalb von `lead`? */
+function isBelow(id, lead) { let c = agentById(id), n = 0; while (c?.supervisorId && n++ < 50) { if (c.supervisorId === lead) return true; c = agentById(c.supervisorId); } return false; }
 function agentEditModal(id) {
   const a = agentById(id); if (!a) return;
   modal(`<div class="modal-head"><h2>${esc(a.name)} bearbeiten</h2><button class="btn btn-icon btn-ghost" data-action="modal-close">${icon('x')}</button></div>
@@ -1033,6 +1379,8 @@ function agentEditModal(id) {
     <div class="field"><label>Name</label><input class="input" id="aName" value="${esc(a.name)}"></div>
     <div class="field"><label>Beschreibung</label><input class="input" id="aDesc" value="${esc(a.description)}"></div>
     <div class="field"><label>Tags (kommagetrennt)</label><input class="input" id="aTags" value="${esc((a.tags || []).join(', '))}"></div>
+    <div class="field"><label>Untersteht (Vorgesetzter)</label><select class="select" id="aSup"><option value="">– niemandem (oberste Ebene) –</option>${S.agents.filter(x => x.id !== a.id && !isBelow(x.id, a.id)).sort((x, y) => (x.role === 'manager' ? -1 : 1) - (y.role === 'manager' ? -1 : 1)).map(x => `<option value="${x.id}" ${x.id === a.supervisorId ? 'selected' : ''}>${x.role === 'manager' ? '👑 ' : ''}${esc(x.name)}</option>`).join('')}</select>
+      <span class="hint">Baukasten: Manager können anderen Managern unterstehen. Rückfragen laufen die Kette hinauf.</span></div>
     <div class="field"><label>Rolle</label><select class="select" id="aRole"><option value="worker" ${a.role !== 'manager' ? 'selected' : ''}>Worker</option><option value="manager" ${a.role === 'manager' ? 'selected' : ''}>Manager (orchestriert)</option></select>
       <span class="hint">Die Rolle wirkt ab dem nächsten Auftrag: Manager erhalten die Orchestrierungs-Anleitung und die Agentenliste.</span></div>
     <div class="field"><label>Farbe</label><div class="target-grid">${['#8B5CF6', '#06B6D4', '#F59E0B', '#10B981', '#EC4899', '#3B82F6', '#EF4444', '#14B8A6', '#A855F7', '#F97316'].map(c => `<button type="button" class="target-opt ${c === a.color ? 'active' : ''}" data-action="pick-color" data-c="${c}" style="width:30px;height:30px;padding:0;background:${c}"></button>`).join('')}</div><input type="hidden" id="aColor" value="${esc(a.color)}"></div>
@@ -1073,7 +1421,7 @@ const actions = {
   'agent-send': (el) => composeModal({ target: `agent:${el.dataset.id}` }),
   'agent-role': async (el) => { const a = agentById(el.dataset.id); await api('PATCH', `/api/agents/${a.id}`, { role: a.role === 'manager' ? 'worker' : 'manager' }); toast('👑', a.role === 'manager' ? `${a.name} ist jetzt Worker` : `${a.name} ist jetzt Manager`); },
   'agent-edit': (el) => agentEditModal(el.dataset.id),
-  'agent-save': async (el) => { await api('PATCH', `/api/agents/${el.dataset.id}`, { name: $('#aName').value, description: $('#aDesc').value, tags: $('#aTags').value.split(',').map(s => s.trim()).filter(Boolean), role: $('#aRole').value, color: $('#aColor').value }); closeModal(); },
+  'agent-save': async (el) => { await api('PATCH', `/api/agents/${el.dataset.id}`, { name: $('#aName').value, description: $('#aDesc').value, tags: $('#aTags').value.split(',').map(s => s.trim()).filter(Boolean), role: $('#aRole').value, color: $('#aColor').value, supervisor: $('#aSup').value }); closeModal(); },
   'agent-del': async (el) => { const a = agentById(el.dataset.id); if (!(await confirmAsk(`${a.name} abmelden? Laufende Aufträge gehen zurück in die Warteschlange.`))) return; await api('DELETE', `/api/agents/${a.id}`); },
   'tpl-edit': (el) => tplModal(el.dataset.id),
   'tpl-save': async (el) => {
@@ -1115,6 +1463,7 @@ const actions = {
   'set-key': async () => { await api('POST', '/api/settings/apikey', {}); toast('🔑', 'Neuer API-Key erzeugt'); },
   'clear-key': async () => { await api('POST', '/api/settings/apikey', { clear: true }); },
   ...projActions,
+  ...chatActions,
 };
 function syncWf() {
   document.querySelectorAll('[data-step]').forEach(el => {
@@ -1134,6 +1483,7 @@ document.addEventListener('change', async (ev) => {
   if (el.dataset.action === 'hook-toggle') await api('PATCH', `/api/webhooks/${el.dataset.id}`, { active: el.checked });
   if (el.dataset.action === 'set-lan') { await api('PUT', '/api/settings', { lanAccess: el.checked }); toast('🌐', el.checked ? 'Netzwerkzugriff aktiviert' : 'Nur noch lokal erreichbar'); setTimeout(refresh, 1200); }
   if (el.dataset.action === 'set-notify') await api('PUT', '/api/settings', { notifications: el.checked });
+  if (el.dataset.action === 'set-docs') await api('PUT', '/api/settings', { docFiles: el.checked });
   if (el.dataset.assign) {
     el.blur();
     try { await api('PATCH', `/api/projects/${el.dataset.p}/parts/${el.dataset.assign}?format=json`, { agentId: el.value }); toast('📌', `Eingeteilt: ${el.value ? agentById(el.value)?.name : 'beliebiger Worker'}`); }
@@ -1146,8 +1496,16 @@ document.addEventListener('input', (ev) => {
 });
 document.addEventListener('keydown', (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 'k') { ev.preventDefault(); composeModal(); }
+  if (ev.key === 'Escape' && document.activeElement?.id === 'chatText' && !$('#modalRoot').innerHTML) { document.activeElement.blur(); }
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter' && $('#cPrompt')) { ev.preventDefault(); composeSend(); }
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter' && $('#askText')) { ev.preventDefault(); actions['ask-ok'](); }
+  else if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter' && document.activeElement?.id === 'chatText') {
+    ev.preventDefault(); const b = document.querySelector('[data-action="chat-send-task"], [data-action="chat-send-agent"]');
+    const inDrawer = $('#drawer').contains(document.activeElement);
+    const btn = inDrawer ? $('#drawer [data-action="chat-send-task"]') : $('#view [data-action="chat-send-agent"]');
+    if (btn || b) actions[(btn || b).dataset.action](btn || b);
+  }
+  else if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter' && document.activeElement?.id === 'pjSupp') { ev.preventDefault(); const b = $('[data-action="proj-supplement"]'); if (b) actions['proj-supplement'](b); }
   if (ev.key === 'Escape') { if ($('#modalRoot').innerHTML) closeModal(); else closeDrawer(); }
 });
 
@@ -1164,6 +1522,6 @@ function applyTheme(v, save) {
   try { docs = (await api('GET', '/api/docs')).endpoints; } catch {}
   await refresh();
   connectEvents();
-  setInterval(() => { if (['overview', 'agents', 'tasks', 'projects'].includes(ui.view)) refreshSoon(); }, 15000);
+  setInterval(() => { if (['overview', 'agents', 'tasks', 'projects', 'chats'].includes(ui.view) || ui.drawerTask) refreshSoon(); }, 15000);
   new MutationObserver(() => { const sel = $('#setTheme'); if (sel && !sel.dataset.init) { sel.dataset.init = 1; try { sel.value = localStorage.getItem('dirigent.theme') || ''; } catch {} } }).observe($('#view'), { childList: true });
 })();

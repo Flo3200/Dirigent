@@ -12,7 +12,7 @@ struct HubSummary {
 
 /// Zentraler Zustand der Plattform. Alle Zugriffe laufen über `queue`.
 final class Hub {
-    static let version = "1.1.0"
+    static let version = "1.2.0"
 
     let queue = DispatchQueue(label: "dirigent.hub")
     let server: HTTPServer
@@ -27,6 +27,11 @@ final class Hub {
     private var saveScheduled = false
     private var lastStatuses: [String: String] = [:]
     private var timers: [DispatchSourceTimer] = []
+    /// Long-Polls auf die Antwort einer Rückfrage (Message-ID → Verbindungen).
+    var messageWaiters: [String: [(conn: HTTPConnection, timer: DispatchSourceTimer)]] = [:]
+    /// Gefundene Claude-Code-Protokolle je Agent.
+    var transcriptCache: [String: URL] = [:]
+    var transcriptMiss: [String: Double] = [:]
     private(set) var serverError: String?
     private(set) var startedAt = nowMs()
 
@@ -206,6 +211,8 @@ final class Hub {
         return "offline"
     }
 
+    func isWaiting(_ agentId: String) -> Bool { waiters[agentId] != nil }
+
     func agentIndex(_ ref: String) -> Int? {
         if let i = db.agents.firstIndex(where: { $0.id == ref }) { return i }
         return db.agents.firstIndex(where: { $0.name.lowercased() == ref.lowercased() })
@@ -232,16 +239,20 @@ final class Hub {
             if let d = p.str("description"), !d.isEmpty { db.agents[i].description = d }
             if let c = p.str("cwd"), !c.isEmpty { db.agents[i].cwd = c }
             if let m = p.str("model"), !m.isEmpty { db.agents[i].model = m }
+            if let s = p.str("supervisor"), !s.isEmpty, let si = agentIndex(s), db.agents[si].id != db.agents[i].id { db.agents[i].supervisorId = db.agents[si].id }
+            transcriptCache[db.agents[i].id] = nil
+            transcriptMiss[db.agents[i].id] = nil
             db.agents[i].lastSeen = t
             emit("agent.registered", "\(db.agents[i].name) hat sich erneut angemeldet", ref: db.agents[i].id)
             return db.agents[i]
         }
-        let a = Agent(id: makeId("ag", 6), name: finalName,
+        var a = Agent(id: makeId("ag", 6), name: finalName,
                       role: p.str("role") == "manager" ? "manager" : "worker",
                       tags: p.strings("tags") ?? [], description: p.str("description") ?? "",
                       cwd: p.str("cwd") ?? "", model: p.str("model") ?? "",
                       color: Hub.palette[db.agents.count % Hub.palette.count],
                       registeredAt: t, lastSeen: t, completed: 0, failed: 0)
+        if let s = p.str("supervisor"), !s.isEmpty, let si = agentIndex(s) { a.supervisorId = db.agents[si].id }
         db.agents.append(a)
         emit("agent.registered", "\(a.name) hat sich angemeldet (\(a.role == "manager" ? "Manager" : "Worker"))", ref: a.id)
         return a
@@ -253,6 +264,13 @@ final class Hub {
         if let tags = p.strings("tags") { db.agents[i].tags = tags }
         if let d = p.str("description") { db.agents[i].description = d }
         if let c = p.str("color"), !c.isEmpty { db.agents[i].color = c }
+        if let s = p.str("supervisor") ?? p.str("supervisorId") {
+            let sid = s.isEmpty ? nil : agentIndex(s).map { db.agents[$0].id }
+            // Keine Kreise im Organigramm
+            var cur = sid, ok = true, guardN = 0
+            while let c = cur, guardN < 100 { if c == db.agents[i].id { ok = false; break }; cur = db.agents.first(where: { $0.id == c })?.supervisorId; guardN += 1 }
+            if ok { db.agents[i].supervisorId = sid }
+        }
         emit("agent.updated", "\(db.agents[i].name) aktualisiert", ref: db.agents[i].id)
     }
 
@@ -267,6 +285,7 @@ final class Hub {
             projectTaskChanged(db.tasks[j])
         }
         db.agents.remove(at: i)
+        for j in db.agents.indices where db.agents[j].supervisorId == a.id { db.agents[j].supervisorId = a.supervisorId }
         emit("agent.removed", "\(a.name) wurde entfernt", ref: a.id)
         dispatch()
     }
@@ -301,6 +320,7 @@ final class Hub {
         }
         lastStatuses[agentId] = "waiting"
         if !wasWaiting { emit("agent.waiting", "\(db.agents[i].name) ist bereit", ref: agentId) } else { publishSummary() }
+        flushInboxAsTask(agentId)
         dispatch()
     }
 
@@ -327,6 +347,7 @@ final class Hub {
         if t.isEmpty { return "any" }
         if ["any", "manager", "all"].contains(t.lowercased()) { return t.lowercased() }
         if t.hasPrefix("agent:") || t.hasPrefix("tag:") { return t }
+        if t.hasPrefix("team:") { let r = String(t.dropFirst(5)); return agentIndex(r).map { "team:\(db.agents[$0].id)" } ?? t }
         if let i = agentIndex(t) { return "agent:\(db.agents[i].id)" }
         return "tag:\(t)"
     }
@@ -335,7 +356,7 @@ final class Hub {
     func createTasks(prompt: String, title: String?, target rawTarget: String, createdBy: String,
                      parentId: String? = nil, notifyAgentId: String? = nil, templateId: String? = nil,
                      runId: String? = nil, stepIndex: Int? = nil, priority: Int = 0, kind: String = "task",
-                     projectId: String? = nil, partId: String? = nil) -> Result<[TaskItem], HubError> {
+                     projectId: String? = nil, partId: String? = nil, docPath: String? = nil) -> Result<[TaskItem], HubError> {
         let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return .failure(.msg("Prompt fehlt")) }
         let target = resolveTarget(rawTarget)
@@ -357,11 +378,13 @@ final class Hub {
         }()
         var created: [TaskItem] = []
         for tg in targets {
-            let t = TaskItem(id: makeId("t"), title: autoTitle, prompt: prompt, target: tg, status: "queued",
+            let tid = makeId("t")
+            let t = TaskItem(id: tid, title: autoTitle, prompt: prompt, target: tg, status: "queued",
                              assignedAgentId: nil, result: nil, error: nil, progress: [], createdAt: nowMs(),
                              startedAt: nil, finishedAt: nil, createdBy: createdBy, parentId: parentId,
                              notifyAgentId: notifyAgentId, templateId: templateId, runId: runId, stepIndex: stepIndex,
-                             priority: priority, kind: kind, projectId: projectId, partId: partId)
+                             priority: priority, kind: kind, projectId: projectId, partId: partId,
+                             docPath: docPath.map { $0.replacingOccurrences(of: "{id}", with: tid) })
             db.tasks.append(t)
             created.append(t)
             emit("task.created", "Neuer Auftrag: \(t.title) → \(targetLabel(tg))", ref: t.id, data: toJSONObject(t))
@@ -379,6 +402,7 @@ final class Hub {
         if t == "all" { return "alle" }
         if t.hasPrefix("agent:"), let i = agentIndex(String(t.dropFirst(6))) { return db.agents[i].name }
         if t.hasPrefix("tag:") { return "#" + t.dropFirst(4) }
+        if t.hasPrefix("team:"), let i = agentIndex(String(t.dropFirst(5))) { return "Team \(db.agents[i].name)" }
         return t
     }
 
@@ -418,6 +442,11 @@ final class Hub {
             let tag = t.target.dropFirst(4).lowercased()
             return best(ready.filter { $0.tags.contains(where: { $0.lowercased() == tag }) })
         }
+        if t.target.hasPrefix("team:") {
+            let lead = String(t.target.dropFirst(5))
+            let members = Set(teamMembers(of: lead))
+            return best(ready.filter { members.contains($0.id) && $0.role != "manager" }) ?? best(ready.filter { members.contains($0.id) })
+        }
         if t.target == "manager" { return best(ready.filter { $0.role == "manager" }) }
         return best(ready.filter { $0.role != "manager" })
     }
@@ -431,10 +460,17 @@ final class Hub {
         db.tasks[i].startedAt = nowMs()
         db.agents[ai].lastSeen = nowMs()
         lastStatuses[agentId] = "working"
+        prepareDocFile(taskIndex: i, agent: db.agents[ai])
         let t = db.tasks[i]
         let agent = db.agents[ai]
         let base = w.base
-        let resp: HTTPResponse = w.json ? .json(["task": toJSONObject(t)]) : .text(Texts.task(t, agent: agent, hub: self, base: base))
+        let inbox = takeInbox(agentId, taskId: t.id)
+        if t.kind == "message" {
+            let ids = Set(inbox.map { $0.id })
+            for j in db.messages.indices where ids.contains(db.messages[j].id) { db.messages[j].viaTaskId = t.id }
+        }
+        let resp: HTTPResponse = w.json ? .json(["task": toJSONObject(t), "messages": inbox.map { toJSONObject($0) }])
+            : .text(Texts.task(t, agent: agent, hub: self, base: base, inbox: inbox))
         let taskId = t.id
         w.conn.send(resp) { [weak self] ok in
             guard let self = self, !ok, let j = self.db.tasks.firstIndex(where: { $0.id == taskId }), self.db.tasks[j].status == "running" else { return }
@@ -519,6 +555,7 @@ final class Hub {
         resolveTaskWaiters(t)
         if let runId = t.runId { advanceRun(runId, finished: t) }
         projectTaskChanged(t)
+        messageTaskFinished(t)
         dispatch()
         return .success(t)
     }
@@ -526,6 +563,10 @@ final class Hub {
     func cancel(_ id: String) -> Result<TaskItem, HubError> {
         guard let i = db.tasks.firstIndex(where: { $0.id == id }) else { return .failure(.msg("Auftrag unbekannt")) }
         guard ["queued", "running"].contains(db.tasks[i].status) else { return .failure(.msg("Auftrag ist nicht aktiv")) }
+        if db.tasks[i].status == "running", let a = db.tasks[i].assignedAgentId, db.tasks[i].kind == "task" {
+            _ = sendMessage(from: "system", to: "agent:\(a)", text: "Der Auftrag „\(db.tasks[i].title)“ (\(id)) wurde ABGEBROCHEN. Höre sofort damit auf, melde kein Ergebnis mehr und starte deinen Warte-Befehl im Hintergrund.",
+                            kind: "system", taskId: id, projectId: db.tasks[i].projectId, urgent: true, replyTo: nil, wake: false)
+        }
         db.tasks[i].status = "cancelled"
         db.tasks[i].finishedAt = nowMs()
         emit("task.cancelled", "Abgebrochen: \(db.tasks[i].title)", ref: id)
@@ -560,13 +601,16 @@ final class Hub {
         return out
     }
 
-    func runTemplate(_ id: String, vars: [String: String], target: String?, createdBy: String, priority: Int = 0) -> Result<[TaskItem], HubError> {
+    var docDefault: Bool { db.settings.docFiles ?? true }
+
+    func runTemplate(_ id: String, vars: [String: String], target: String?, createdBy: String, priority: Int = 0, doc: Bool? = nil) -> Result<[TaskItem], HubError> {
         guard let i = db.templates.firstIndex(where: { $0.id == id || $0.name.lowercased() == id.lowercased() }) else { return .failure(.msg("Vorlage unbekannt")) }
         let tpl = db.templates[i]
         db.templates[i].lastRunAt = nowMs()
         return createTasks(prompt: Hub.render(tpl.prompt, vars), title: tpl.name,
                            target: (target?.isEmpty == false ? target! : tpl.target), createdBy: createdBy,
-                           templateId: tpl.id, priority: priority)
+                           templateId: tpl.id, priority: priority,
+                           docPath: (doc ?? (docDefault && createdBy != "zeitplan")) ? Hub.taskDocPath(title: tpl.name) : nil)
     }
 
     private func runSchedules() {
@@ -607,7 +651,8 @@ final class Hub {
         for (n, r) in run.results.enumerated() { vars["step\(n + 1)"] = r }
         let fullPrompt = Hub.render(prompt, vars) + "\n\n(Workflow \"\(wf.name)\", Schritt \(run.currentStep + 1)/\(wf.steps.count): \(step.name))"
         switch createTasks(prompt: fullPrompt, title: "\(wf.name) · \(step.name)", target: target.isEmpty ? "any" : target,
-                           createdBy: createdBy, runId: runId, stepIndex: run.currentStep) {
+                           createdBy: createdBy, runId: runId, stepIndex: run.currentStep,
+                           docPath: docDefault ? Hub.taskDocPath(title: "\(wf.name) \(step.name)") : nil) {
         case .success(let ts):
             if let ri2 = db.runs.firstIndex(where: { $0.id == runId }) { db.runs[ri2].taskIds.append(contentsOf: ts.map { $0.id }) }
             return nil
@@ -654,6 +699,7 @@ final class Hub {
             "runs": db.runs.suffix(100).map { toJSONObject($0) },
             "webhooks": db.webhooks.map { toJSONObject($0) },
             "projects": db.projects.map { toJSONObject($0) },
+            "messages": db.messages.suffix(600).map { toJSONObject($0) },
             "events": db.events.suffix(200).map { toJSONObject($0) },
             "settings": settings,
             "server": [

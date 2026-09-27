@@ -8,9 +8,9 @@ let apiDocs: [[String: String]] = [
     ["method": "GET", "path": "/api/events", "desc": "Live-Ereignisse als Server-Sent Events"],
     ["method": "GET", "path": "/api/docs", "desc": "Diese Endpunkt-Liste als JSON"],
     ["method": "GET", "path": "/api/agents", "desc": "Alle Agenten mit Status"],
-    ["method": "POST", "path": "/api/agents", "desc": "Agent registrieren: name, role (worker|manager), tags, description, cwd, model. ?format=text liefert Anleitung"],
+    ["method": "POST", "path": "/api/agents", "desc": "Agent registrieren: name, role (worker|manager), tags, description, cwd, model, supervisor. ?format=text liefert Anleitung"],
     ["method": "GET", "path": "/api/agents/:id", "desc": "Einzelnen Agenten abrufen"],
-    ["method": "PATCH", "path": "/api/agents/:id", "desc": "Agent ändern (name, role, tags, description, color)"],
+    ["method": "PATCH", "path": "/api/agents/:id", "desc": "Agent ändern (name, role, tags, description, color, supervisor)"],
     ["method": "DELETE", "path": "/api/agents/:id", "desc": "Agent abmelden/entfernen"],
     ["method": "GET", "path": "/api/agents/:id/wait", "desc": "Long-Poll: blockiert bis ein Auftrag kommt (Text; ?format=json). 204 bei Timeout (?timeout=Sek.)"],
     ["method": "GET", "path": "/api/tasks", "desc": "Aufträge auflisten (?status=&agent=&limit=)"],
@@ -36,6 +36,18 @@ let apiDocs: [[String: String]] = [
     ["method": "POST", "path": "/api/workflows/:id/run", "desc": "Workflow starten: {input}. Variablen: {{input}}, {{prev}}, {{step1}}…"],
     ["method": "GET", "path": "/api/runs/:id", "desc": "Workflow-Lauf abrufen"],
     ["method": "POST", "path": "/api/runs/:id/cancel", "desc": "Workflow-Lauf abbrechen"],
+    ["method": "POST", "path": "/api/tasks/:id/ask", "desc": "Rückfrage des Agenten (Rohtext) → an seinen Manager/Vorgesetzten bzw. den Nutzer. Antwort enthält Warte-Befehl"],
+    ["method": "POST", "path": "/api/tasks/:id/message", "desc": "Nachricht an den Agenten des Auftrags ({text, urgent}; to=manager → Ergänzung an den zuständigen Manager)"],
+    ["method": "GET", "path": "/api/tasks/:id/doc", "desc": "Beschreibungsdatei des Auftrags (.dirigent/…md)"],
+    ["method": "POST", "path": "/api/agents/:id/messages", "desc": "Direkte Nachricht an einen Agenten (Rohtext; from, task, urgent=1 = Unterbrechung)"],
+    ["method": "GET", "path": "/api/agents/:id/inbox", "desc": "Offene Nachrichten abholen (Text; ?format=json)"],
+    ["method": "GET", "path": "/api/agents/:id/transcript", "desc": "Live-Protokoll der Claude-Code-Sitzung (?since=ms&limit=)"],
+    ["method": "GET", "path": "/api/messages", "desc": "Nachrichten (?agent=&task=&project=&open=1)"],
+    ["method": "POST", "path": "/api/messages", "desc": "Nachricht senden: to (agent:<name>|user), text, from, task, project, urgent, kind"],
+    ["method": "POST", "path": "/api/messages/:id/answer", "desc": "Rückfrage beantworten (Rohtext)"],
+    ["method": "POST", "path": "/api/messages/:id/escalate", "desc": "Rückfrage an den Vorgesetzten bzw. Nutzer weiterleiten"],
+    ["method": "GET", "path": "/api/messages/:id/wait", "desc": "Long-Poll: blockiert bis die Rückfrage beantwortet ist (Text)"],
+    ["method": "POST", "path": "/api/projects/:id/message", "desc": "Ergänzung an den Projekt-Manager – er zerlegt sie und verteilt sie an die Agenten"],
     ["method": "GET", "path": "/api/projects", "desc": "Projekte auflisten"],
     ["method": "POST", "path": "/api/projects", "desc": "Projekt anlegen: name, goal, cwd, manager, requireReview (Standard true), plan (Standard true = Planung beim Manager anfordern)"],
     ["method": "GET", "path": "/api/projects/:id", "desc": "Projekt abrufen (?format=text = Überblick für Agenten)"],
@@ -85,7 +97,7 @@ extension Hub {
         }
 
         if parts == ["join"] || parts == ["api", "join"] {
-            return .text(Texts.join(base: base, name: req.query["name"], role: req.query["role"], tags: req.query["tags"]))
+            return .text(Texts.join(base: base, name: req.query["name"], role: req.query["role"], tags: req.query["tags"], supervisor: req.query["supervisor"]))
         }
         guard parts.count >= 2 else {
             return .text("🎼 Dirigent API \(Hub.version)\nAnleitung für Agenten: \(base)/join\nEndpunkte: \(base)/api/docs\n")
@@ -98,7 +110,7 @@ extension Hub {
 
         switch parts[1] {
         case "state": return .json(snapshot())
-        case "docs": return .json(["endpoints": apiDocs, "targets": ["any", "manager", "all", "agent:<id|name>", "tag:<tag>"], "version": Hub.version])
+        case "docs": return .json(["endpoints": apiDocs, "targets": ["any", "manager", "all", "agent:<id|name>", "tag:<tag>", "team:<manager>"], "version": Hub.version])
         case "overview": return .text(Texts.overview(hub: self))
         case "events":
             addSSE(conn)
@@ -126,6 +138,22 @@ extension Hub {
                 addWaiter(agentId: agentId, conn: conn, timeout: timeout, json: req.query["format"] == "json", base: base)
                 return nil
             case ("GET", "instructions"): return .text(Texts.registered(db.agents[i], base: base, hub: self))
+            case ("POST", "messages"):
+                let raw: String = { if let j = req.json { return j.str("text") ?? "" }; if req.isForm { return p.str("text") ?? "" }; return req.bodyString }()
+                guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .error("Text fehlt", text: text) }
+                let fromRef = p.str("from").flatMap { agentIndex($0) }.map { "agent:\(db.agents[$0].id)" } ?? "user"
+                let taskRef = p.str("task").flatMap { tr in db.tasks.first(where: { $0.id == tr }) }
+                let m = sendMessage(from: fromRef, to: "agent:\(agentId)", text: raw, kind: p.str("kind") ?? "message", taskId: taskRef?.id,
+                                    projectId: taskRef?.projectId, urgent: p.bool("urgent") ?? false)
+                let how = isWaiting(agentId) || m.status == "delivered" ? "sofort zugestellt" : "wird beim nächsten Kontakt (Zwischenstand, Rückfrage, neuer Auftrag) zugestellt"
+                return req.json == nil || text ? .text("✉️ Nachricht \(m.id) an \(db.agents[i].name) – \(how).\n") : .json(toJSONObject(m), status: 201)
+            case ("GET", "inbox"):
+                let inbox = takeInbox(agentId)
+                if req.query["format"] == "json" { return .json(inbox.map { toJSONObject($0) }) }
+                return .text(inbox.isEmpty ? "Keine neuen Nachrichten.\n" : Texts.inboxText(inbox, agent: db.agents[i], base: base, hub: self))
+            case ("GET", "transcript"):
+                guard req.isLocal || !db.settings.apiKey.isEmpty else { return .error("Live-Protokoll nur lokal oder mit API-Key", status: 401) }
+                return .json(transcript(agentId: agentId, since: req.query["since"].flatMap(Double.init), limit: Int(req.query["limit"] ?? "300") ?? 300))
             default: break
             }
 
@@ -147,9 +175,11 @@ extension Hub {
                     var notifyId: String? = nil
                     if notify, let f = from, let ai = agentIndex(f) { notifyId = db.agents[ai].id }
                     let createdBy = from.flatMap { agentIndex($0) }.map { "agent:\(db.agents[$0].id)" } ?? (p.str("createdBy") ?? creator)
+                    let wantsDoc = p.bool("doc") ?? docDefault
+                    let docTitle = p.str("title").flatMap { $0.isEmpty ? nil : $0 } ?? String(prompt.split(separator: "\n").first ?? "auftrag")
                     let res = createTasks(prompt: prompt, title: p.str("title"), target: p.str("target") ?? "any",
                                           createdBy: createdBy, parentId: p.str("parent"), notifyAgentId: notifyId,
-                                          priority: p.int("priority") ?? 0)
+                                          priority: p.int("priority") ?? 0, docPath: wantsDoc ? Hub.taskDocPath(title: docTitle) : nil)
                     switch res {
                     case .success(let ts):
                         if text { return .text(ts.map { "✅ Auftrag \($0.id) erstellt → \(targetLabel($0.target))" }.joined(separator: "\n") + "\n") }
@@ -194,7 +224,38 @@ extension Hub {
                 return reply(finish(id, success: false, text: bodyText("error")),
                              "Fehler gespeichert. Starte jetzt den Warte-Befehl wieder im Hintergrund und beende deinen Zug.")
             case ("POST", "progress"):
-                return reply(addProgress(id, bodyText("text")), "📝 Zwischenstand gespeichert.")
+                let res = addProgress(id, bodyText("text"))
+                if case .success(let t) = res, let aid = t.assignedAgentId, let a = db.agents.first(where: { $0.id == aid }) {
+                    let inbox = takeInbox(aid, taskId: t.id)
+                    if req.query["format"] == "json" { return .json(["task": toJSONObject(t), "messages": inbox.map { toJSONObject($0) }]) }
+                    let st = t.status == "cancelled" ? "\n⛔ Dieser Auftrag ist ABGEBROCHEN. Höre auf, melde kein Ergebnis und starte deinen Warte-Befehl im Hintergrund.\n" : ""
+                    return .text("📝 Zwischenstand gespeichert.\n" + st + (inbox.isEmpty ? "Keine neuen Nachrichten.\n" : "\n" + Texts.inboxText(inbox, agent: a, base: base, hub: self)))
+                }
+                return reply(res, "📝 Zwischenstand gespeichert.")
+            case ("POST", "ask"):
+                switch ask(taskId: id, text: bodyText("question"), from: p.str("from")) {
+                case .success(let q): return req.query["format"] == "json" ? .json(toJSONObject(q)) : .text(Texts.askedReply(q, base: base, hub: self))
+                case .failure(.msg(let e)): return .error(e, status: 409, text: true)
+                }
+            case ("POST", "message"):
+                // Nachricht an den Agenten dieses Auftrags (oder to=manager → an den zuständigen Manager)
+                let t = db.tasks[ti]
+                let msgText = bodyText("text")
+                guard !msgText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .error("Text fehlt", text: text) }
+                let fromRef = p.str("from").flatMap { agentIndex($0) }.map { "agent:\(db.agents[$0].id)" } ?? "user"
+                var to = t.assignedAgentId.map { "agent:\($0)" } ?? "task"
+                var kind = "message"
+                if p.str("to") == "manager" {
+                    let sup = supervisorRef(task: t, agentId: t.assignedAgentId ?? "")
+                    guard sup != "user" else { return .error("Kein zuständiger Manager für diesen Auftrag", status: 409, text: text) }
+                    to = sup; kind = "supplement"
+                }
+                let m = sendMessage(from: fromRef, to: to, text: msgText, kind: kind, taskId: t.id, projectId: t.projectId, urgent: p.bool("urgent") ?? false)
+                return text ? .text("✉️ Nachricht \(m.id) an \(partyName(to)) – wird beim nächsten Kontakt zugestellt.\n") : .json(toJSONObject(m), status: 201)
+            case ("GET", "doc"):
+                let t = db.tasks[ti]
+                guard let d = readDoc(t) else { return .error(t.docPath == nil ? "Keine Beschreibungsdatei für diesen Auftrag" : "Beschreibungsdatei noch nicht angelegt (wird bei Zustellung erstellt)", status: 404, text: text) }
+                return req.query["format"] == "json" ? .json(["path": t.docFile ?? "", "content": d]) : .text(d)
             case ("POST", "cancel"): return reply(cancel(id), "Abgebrochen.")
             case ("POST", "retry"): return reply(retry(id), "Erneut eingereiht.")
             case ("GET", "wait"):
@@ -243,7 +304,7 @@ extension Hub {
                 let from = p.str("from").flatMap { agentIndex($0) }.map { db.agents[$0].id }
                 let tplId = db.templates[i].id
                 switch runTemplate(tplId, vars: vars, target: p.str("target"), createdBy: from.map { "agent:\($0)" } ?? (p.str("createdBy") ?? creator),
-                                   priority: p.int("priority") ?? 0) {
+                                   priority: p.int("priority") ?? 0, doc: p.bool("doc")) {
                 case .success(let ts):
                     if (p.bool("notify") ?? false), let f = from {
                         for t in ts { if let j = db.tasks.firstIndex(where: { $0.id == t.id }) { db.tasks[j].notifyAgentId = f; db.tasks[j].parentId = p.str("parent") } }
@@ -308,6 +369,57 @@ extension Hub {
             }
             if m == "DELETE" { db.runs.remove(at: ri); changed(); return .json(["ok": true]) }
 
+        // MARK: Nachrichten
+        case "messages":
+            if id.isEmpty {
+                if m == "GET" {
+                    var list = db.messages
+                    if let a = req.query["agent"], let ai = agentIndex(a) { let r = "agent:\(db.agents[ai].id)"; list = list.filter { $0.from == r || $0.to == r } }
+                    if let t = req.query["task"] { list = list.filter { $0.taskId == t } }
+                    if let pj = req.query["project"] { list = list.filter { $0.projectId == pj } }
+                    if req.query["open"] != nil { list = list.filter { $0.kind == "question" && $0.status != "answered" } }
+                    return .json(list.suffix(Int(req.query["limit"] ?? "300") ?? 300).map { toJSONObject($0) })
+                }
+                if m == "POST" {
+                    let body = p.str("text") ?? (req.json == nil && !req.isForm ? req.bodyString : "")
+                    guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .error("Text fehlt", text: text) }
+                    guard let toRaw = p.str("to"), !toRaw.isEmpty else { return .error("Empfänger (to) fehlt: agent:<name> oder user", text: text) }
+                    var to = toRaw
+                    if toRaw != "user" {
+                        let r = toRaw.hasPrefix("agent:") ? String(toRaw.dropFirst(6)) : toRaw
+                        guard let ai = agentIndex(r) else { return .error("Agent '\(r)' unbekannt", status: 404, text: text) }
+                        to = "agent:\(db.agents[ai].id)"
+                    }
+                    let fromRef = p.str("from").flatMap { agentIndex($0) }.map { "agent:\(db.agents[$0].id)" } ?? "user"
+                    let msg = sendMessage(from: fromRef, to: to, text: body, kind: p.str("kind") ?? "message", taskId: p.str("task"),
+                                          projectId: p.str("project"), urgent: p.bool("urgent") ?? false)
+                    return text ? .text("✉️ Nachricht \(msg.id) an \(partyName(to)).\n") : .json(toJSONObject(msg), status: 201)
+                }
+            }
+            guard db.messages.contains(where: { $0.id == id }) else { return .error("Nachricht unbekannt", status: 404, text: true) }
+            let fromRef = p.str("from").flatMap { agentIndex($0) }.map { "agent:\(db.agents[$0].id)" } ?? "user"
+            let raw: String = { if let j = req.json { return j.str("text") ?? j.str("answer") ?? j.str("note") ?? "" }; if req.isForm { return p.str("text") ?? "" }; return req.bodyString }()
+            switch (m, action) {
+            case ("GET", ""): return .json(toJSONObject(db.messages.first(where: { $0.id == id })!))
+            case ("POST", "answer"):
+                switch answerMessage(id, text: raw, from: fromRef) {
+                case .success(let a): return req.json != nil ? .json(toJSONObject(a)) : .text("✅ Antwort zugestellt. Mach mit deiner eigentlichen Arbeit weiter.\n")
+                case .failure(.msg(let e)): return .error(e, status: 409, text: req.json == nil)
+                }
+            case ("POST", "escalate"):
+                switch escalate(id, from: fromRef, note: raw) {
+                case .success(let q): return req.json != nil ? .json(toJSONObject(q)) : .text("↗️ Rückfrage weitergeleitet an \(partyName(q.to)).\n")
+                case .failure(.msg(let e)): return .error(e, status: 409, text: req.json == nil)
+                }
+            case ("GET", "wait"):
+                let timeout = min(max(Double(req.query["timeout"] ?? "55") ?? 55, 1), 600)
+                return waitForMessage(id, conn: conn, timeout: timeout)
+            case ("DELETE", ""):
+                db.messages.removeAll { $0.id == id }; changed()
+                return .json(["ok": true])
+            default: break
+            }
+
         // MARK: Projekte
         case "projects":
             return handleProjects(req, parts: parts, base: base)
@@ -357,6 +469,7 @@ extension Hub {
                 if let v = p.int("port"), v > 0, v < 65536, v != db.settings.port { db.settings.port = v; restart = true }
                 if let v = p.bool("lanAccess"), v != db.settings.lanAccess { db.settings.lanAccess = v; restart = true }
                 if let v = p.bool("notifications") { db.settings.notifications = v }
+                if let v = p.bool("docFiles") { db.settings.docFiles = v }
                 saveNow()
                 changed()
                 if restart {
