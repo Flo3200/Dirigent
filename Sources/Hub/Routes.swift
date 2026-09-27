@@ -36,6 +36,21 @@ let apiDocs: [[String: String]] = [
     ["method": "POST", "path": "/api/workflows/:id/run", "desc": "Workflow starten: {input}. Variablen: {{input}}, {{prev}}, {{step1}}…"],
     ["method": "GET", "path": "/api/runs/:id", "desc": "Workflow-Lauf abrufen"],
     ["method": "POST", "path": "/api/runs/:id/cancel", "desc": "Workflow-Lauf abbrechen"],
+    ["method": "GET", "path": "/api/projects", "desc": "Projekte auflisten"],
+    ["method": "POST", "path": "/api/projects", "desc": "Projekt anlegen: name, goal, cwd, manager, requireReview (Standard true), plan (Standard true = Planung beim Manager anfordern)"],
+    ["method": "GET", "path": "/api/projects/:id", "desc": "Projekt abrufen (?format=text = Überblick für Agenten)"],
+    ["method": "PATCH", "path": "/api/projects/:id", "desc": "Projekt ändern (name, goal, cwd, manager, requireReview, summary)"],
+    ["method": "DELETE", "path": "/api/projects/:id", "desc": "Projekt löschen (bricht laufende Aufträge ab)"],
+    ["method": "POST", "path": "/api/projects/:id/plan", "desc": "Manager reicht Plan ein (JSON): {summary, standards:[{category,title,rule,mandatory}], parts:[{key,name,goal,prompt,acceptance[],paths[],tags[],dependsOn[],suggestedAgent}]}"],
+    ["method": "POST", "path": "/api/projects/:id/replan", "desc": "Überarbeitung beim Manager anfordern (Rohtext oder {feedback})"],
+    ["method": "POST", "path": "/api/projects/:id/approve", "desc": "Alle Entwürfe freigeben (optional {parts:[ids]})"],
+    ["method": "POST", "path": "/api/projects/:id/cancel", "desc": "Projekt abbrechen"],
+    ["method": "POST", "path": "/api/projects/:id/standards", "desc": "Standard ergänzen: category, title, rule, mandatory · PATCH/DELETE …/standards/:sid"],
+    ["method": "POST", "path": "/api/projects/:id/parts", "desc": "Teilbereich ergänzen · PATCH …/parts/:pid (Inhalt im Entwurf, agentId = einteilen) · DELETE"],
+    ["method": "POST", "path": "/api/projects/:id/parts/:pid/approve", "desc": "Teilbereich freigeben → Worker erhält den Auftrag (sobald Abhängigkeiten abgenommen sind)"],
+    ["method": "POST", "path": "/api/projects/:id/parts/:pid/unapprove", "desc": "Freigabe zurückziehen (nur vor Arbeitsbeginn)"],
+    ["method": "POST", "path": "/api/projects/:id/parts/:pid/accept", "desc": "Abgelieferten Teilbereich abnehmen (Rohtext = Notiz)"],
+    ["method": "POST", "path": "/api/projects/:id/parts/:pid/rework", "desc": "Nacharbeit anfordern (Rohtext oder {note, prompt}) → zurück in den Entwurf, erneute Freigabe nötig"],
     ["method": "GET", "path": "/api/webhooks", "desc": "Webhooks auflisten"],
     ["method": "POST", "path": "/api/webhooks", "desc": "Webhook anlegen: url, events ([\"*\"] oder z. B. task.completed, agent.*)"],
     ["method": "PATCH", "path": "/api/webhooks/:id", "desc": "Webhook ändern (active, url, events)"],
@@ -292,6 +307,10 @@ extension Hub {
                 return .json(toJSONObject(db.runs[ri]))
             }
             if m == "DELETE" { db.runs.remove(at: ri); changed(); return .json(["ok": true]) }
+
+        // MARK: Projekte
+        case "projects":
+            return handleProjects(req, parts: parts, base: base)
 
         // MARK: Webhooks
         case "webhooks":

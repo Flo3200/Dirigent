@@ -58,6 +58,7 @@ enum Texts {
     static func task(_ t: TaskItem, agent a: Agent, hub: Hub, base: String) -> String {
         let from: String = {
             if t.createdBy.hasPrefix("agent:"), let i = hub.agentIndex(String(t.createdBy.dropFirst(6))) { return "Agent \(hub.db.agents[i].name)" }
+            if t.createdBy.hasPrefix("project:"), let p = hub.db.projects.first(where: { $0.id == String(t.createdBy.dropFirst(8)) }) { return "Projekt „\(p.name)“" + (t.partId != nil && t.kind == "task" ? " (vom Nutzer freigegeben)" : "") }
             switch t.createdBy {
             case "user": return "Nutzer (Dashboard)"
             case "system": return "Dirigent"
@@ -77,7 +78,12 @@ enum Texts {
 
 
         """
-        if a.role == "manager" { s += managerGuide(a, base: base, hub: hub, parentId: t.parentId ?? t.id) + "\n" }
+        if let pid = t.projectId, let p = hub.db.projects.first(where: { $0.id == pid }) {
+            if t.kind == "task" && t.partId == nil { s += planGuide(p, agent: a, base: base, hub: hub) + "\n" }
+            if t.kind == "notification", let partId = t.partId, let part = p.parts.first(where: { $0.id == partId }) {
+                s += reviewGuide(p, part, agent: a, base: base) + "\n"
+            }
+        } else if a.role == "manager" { s += managerGuide(a, base: base, hub: hub, parentId: t.parentId ?? t.id) + "\n" }
         s += """
         ## Wenn du fertig bist
         Ergebnis melden (knappe, aussagekräftige Zusammenfassung):
@@ -141,6 +147,12 @@ enum Texts {
             let who = t.assignedAgentId.flatMap { id in hub.db.agents.first(where: { $0.id == id })?.name } ?? hub.targetLabel(t.target)
             return "  • [\(t.status)] \(t.title) → \(who)  (\(t.id))"
         }.joined(separator: "\n") + "\n"
+        let projects = hub.db.projects.filter { $0.status != "cancelled" }.suffix(8)
+        if !projects.isEmpty {
+            s += "\nProjekte:\n" + projects.map { p in
+                "  • \(p.name) [\(p.id)] – \(p.status) · \(p.parts.filter { $0.status == "accepted" }.count)/\(p.parts.count) abgenommen"
+            }.joined(separator: "\n") + "\n"
+        }
         let recent = hub.db.tasks.filter { $0.status == "done" || $0.status == "failed" }.suffix(8)
         s += "\nZuletzt abgeschlossen:\n"
         s += recent.isEmpty ? "  (keine)\n" : recent.reversed().map { "  • [\($0.status)] \($0.title) (\($0.id))" }.joined(separator: "\n") + "\n"

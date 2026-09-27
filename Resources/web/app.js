@@ -34,17 +34,20 @@ const P = {
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   hook: '<path d="M18 16.1A5 5 0 0 1 15 7M6 16.1a5 5 0 1 0 6 2.9M12 6a3 3 0 1 1 0 .01M6 16l6-10 6 10"/>',
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+  layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/><path d="m3 17.5 9 5 9-5" opacity=".55"/>',
+  shield: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
 };
 const icon = (n, cls = '') => `<span class="ico ${cls}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${P[n] || ''}</svg></span>`;
 function hydrateIcons(root = document) { root.querySelectorAll('[data-ico]').forEach(el => { el.outerHTML = icon(el.dataset.ico); }); }
 
 /* ───────── Zustand ───────── */
-let S = { agents: [], tasks: [], templates: [], workflows: [], runs: [], webhooks: [], events: [], settings: {}, server: {} };
+let S = { agents: [], tasks: [], templates: [], workflows: [], runs: [], webhooks: [], projects: [], events: [], settings: {}, server: {} };
 let docs = [];
 const ui = {
   view: (() => { try { return localStorage.getItem('dirigent.view') || 'overview'; } catch { return 'overview'; } })(),
   taskFilter: 'all', taskSearch: '', drawerTask: null, connected: false,
+  project: null, openParts: new Set(), ask: null,
 };
 
 const api = async (method, path, body) => {
@@ -79,6 +82,9 @@ function connectEvents() {
     else if (ev.type === 'task.failed') toast('⚠️', ev.message);
     else if (ev.type === 'agent.registered') toast('👋', ev.message);
     else if (ev.type === 'workflow.completed') toast('🎼', ev.message);
+    else if (ev.type === 'project.planned') toast('📋', ev.message);
+    else if (ev.type === 'project.part.rework') toast('🔁', ev.message);
+    else if (ev.type === 'project.completed') toast('🏁', ev.message);
   };
   es.onerror = () => { ui.connected = false; renderServerCard(); };
   es.onopen = () => { ui.connected = true; refreshSoon(); };
@@ -125,6 +131,7 @@ function creatorLabel(c) {
   if (c === 'zeitplan') return 'Zeitplan';
   if (c.startsWith('agent:')) return agentById(c.slice(6))?.name || c;
   if (c.startsWith('workflow:')) return 'Workflow';
+  if (c.startsWith('project:')) return `Projekt ${projById(c.slice(8))?.name || ''} (freigegeben)`;
   return c;
 }
 
@@ -155,6 +162,7 @@ const joinPrompt = (role = 'worker') => role === 'manager'
 /* ───────── Navigation ───────── */
 const VIEWS = [
   { id: 'overview', label: 'Übersicht', icon: 'home', sub: 'Dein Orchester auf einen Blick' },
+  { id: 'projects', label: 'Projekte', icon: 'layers', sub: 'Manager plant · du teilst ein und gibst frei · Worker setzen um' },
   { id: 'agents', label: 'Agenten', icon: 'bot', sub: 'Angemeldete KI-Agenten – bereit ohne Token-Verbrauch' },
   { id: 'tasks', label: 'Aufträge', icon: 'list', sub: 'Alle Aufträge, live verteilt' },
   { id: 'templates', label: 'Vorlagen', icon: 'template', sub: 'Vorgefertigte Aufgaben, die Agenten als Prompt erhalten' },
@@ -170,11 +178,13 @@ function renderNav() {
     agents: S.agents.filter(a => a.status === 'waiting' || a.status === 'working').length,
     tasks: S.tasks.filter(t => t.status === 'queued' || t.status === 'running').length,
     templates: S.templates.length, workflows: S.runs.filter(r => r.status === 'running').length,
+    projects: (S.projects || []).filter(p => p.status !== 'done' && p.status !== 'cancelled').length,
   };
+  const needsYou = (S.projects || []).some(p => projAttention(p).length);
   $('#nav').innerHTML = VIEWS.map(v => v.sep ? '<div class="nav-sep"></div>' : `
     <button class="nav-item ${ui.view === v.id ? 'active' : ''}" data-action="nav" data-view="${v.id}">
       ${icon(v.icon)}<span>${v.label}</span>
-      ${counts[v.id] ? `<span class="count ${v.id === 'agents' || v.id === 'tasks' || v.id === 'workflows' ? 'live' : ''}">${counts[v.id]}</span>` : ''}
+      ${counts[v.id] ? `<span class="count ${v.id === 'agents' || v.id === 'tasks' || v.id === 'workflows' || (v.id === 'projects' && needsYou) ? 'live' : ''}" ${v.id === 'projects' && needsYou ? 'title="Braucht deine Freigabe"' : ''}>${counts[v.id]}</span>` : ''}
     </button>`).join('');
 }
 
@@ -197,13 +207,14 @@ function render() {
   const actions = {
     overview: `<button class="btn" data-action="join">${icon('terminal')} Agent anmelden</button><button class="btn btn-primary" data-action="compose">${icon('send')} Neuer Auftrag <kbd>⌘K</kbd></button>`,
     agents: `<button class="btn btn-primary" data-action="join">${icon('plus')} Agent anmelden</button>`,
+    projects: `<button class="btn" data-action="join">${icon('terminal')} Agent anmelden</button><button class="btn btn-primary" data-action="proj-new">${icon('plus')} Neues Projekt</button>`,
     tasks: `<button class="btn btn-primary" data-action="compose">${icon('send')} Neuer Auftrag</button>`,
     templates: `<button class="btn btn-primary" data-action="tpl-edit">${icon('plus')} Neue Vorlage</button>`,
     workflows: `<button class="btn btn-primary" data-action="wf-edit">${icon('plus')} Neuer Workflow</button>`,
     integrate: `<button class="btn" data-action="open-browser">${icon('globe')} Im Browser öffnen</button>`,
   };
   $('#topActions').innerHTML = actions[ui.view] || '';
-  const views = { overview: vOverview, agents: vAgents, tasks: vTasks, templates: vTemplates, workflows: vWorkflows, activity: vActivity, integrate: vIntegrate, settings: vSettings };
+  const views = { overview: vOverview, projects: vProjects, agents: vAgents, tasks: vTasks, templates: vTemplates, workflows: vWorkflows, activity: vActivity, integrate: vIntegrate, settings: vSettings };
   const ae = document.activeElement;
   if (ae && $('#view').contains(ae) && /INPUT|TEXTAREA|SELECT/.test(ae.tagName) && ae.id !== 'taskSearch') { if (ui.drawerTask) renderDrawer(); return; }
   const scroll = $('#view').scrollTop;
@@ -241,6 +252,10 @@ function vOverview() {
       <div class="panel-body"><div class="feed">${[...S.events].reverse().slice(0, 14).map(feedItem).join('') || '<div class="faint">Noch nichts passiert.</div>'}</div></div>
     </div>
   </div>`;
+  const openProjects = (S.projects || []).filter(p => p.status !== 'done' && p.status !== 'cancelled');
+  if (openProjects.length) {
+    html += `<div class="section-title">Projekte</div><div class="grid grid-cards">${openProjects.slice(-4).reverse().map(projCard).join('')}</div>`;
+  }
   if (S.templates.length) {
     html += `<div class="section-title">Schnellstart-Vorlagen</div><div class="grid grid-cards">${S.templates.slice(0, 4).map(t => `
       <div class="panel tpl-card clickable" data-action="tpl-run" data-id="${t.id}">
@@ -281,10 +296,10 @@ function taskRow(t) {
   </div>`;
 }
 
-const EV_ICON = { 'task.created': '📨', 'task.started': '⚡', 'task.completed': '✅', 'task.failed': '⚠️', 'task.progress': '📝', 'task.cancelled': '⛔', 'agent.registered': '👋', 'agent.waiting': '🟢', 'agent.offline': '💤', 'agent.removed': '🗑️', 'workflow.started': '🎼', 'workflow.completed': '🏁', 'workflow.failed': '💥', 'hub.started': '🚀' };
+const EV_ICON = { 'project.created': '🗂️', 'project.planned': '📋', 'project.status': '🔄', 'project.part.approved': '🟢', 'project.part.accepted': '🏅', 'project.part.rework': '🔁', 'project.completed': '🏁', 'project.cancelled': '⛔', 'project.deleted': '🗑️', 'task.created': '📨', 'task.started': '⚡', 'task.completed': '✅', 'task.failed': '⚠️', 'task.progress': '📝', 'task.cancelled': '⛔', 'agent.registered': '👋', 'agent.waiting': '🟢', 'agent.offline': '💤', 'agent.removed': '🗑️', 'workflow.started': '🎼', 'workflow.completed': '🏁', 'workflow.failed': '💥', 'hub.started': '🚀' };
 function feedItem(e) {
-  const clickable = e.ref && e.ref.startsWith('t_');
-  return `<div class="feed-item ${clickable ? 'clickable' : ''}" ${clickable ? `data-action="task-open" data-id="${e.ref}"` : ''}>
+  const clickable = e.ref && (e.ref.startsWith('t_') || (e.ref.startsWith('pj_') && projById(e.ref)));
+  return `<div class="feed-item ${clickable ? 'clickable' : ''}" ${clickable ? `data-action="${e.ref.startsWith('pj_') ? 'proj-open' : 'task-open'}" data-id="${e.ref}"` : ''}>
     <div class="feed-ico">${EV_ICON[e.type] || '•'}</div><div class="m">${esc(e.message)}</div><div class="t">${ago(e.time)}</div></div>`;
 }
 
@@ -306,6 +321,7 @@ function agentCard(a) {
     ${a.tags?.length ? `<div class="agent-meta">${a.tags.map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div>` : ''}
     ${a.cwd ? `<div class="agent-cwd" title="${esc(a.cwd)}">${icon('folder', 'sm')} ${esc(a.cwd.replace(/^\/Users\/[^/]+/, '~'))}</div>` : ''}
     ${cur.map(t => `<div class="agent-now" data-action="task-open" data-id="${t.id}">${icon('zap', 'sm')}<span>${esc(t.title)}</span></div>`).join('')}
+    ${(S.projects || []).flatMap(p => p.status === 'cancelled' ? [] : p.parts.filter(x => x.agentId === a.id && ['draft', 'waiting', 'queued'].includes(x.status)).map(x => `<div class="agent-plan" data-action="proj-open" data-id="${p.id}">📌<span>${esc(p.name)} · ${esc(x.name)}</span><em>${x.status === 'draft' ? 'eingeteilt · wartet auf Freigabe' : 'freigegeben'}</em></div>`)).join('')}
     ${a.status === 'working' ? '<div class="working-bar"></div>' : ''}
     <div class="agent-stats"><span><b>${a.completed}</b> erledigt</span><span><b>${a.failed}</b> Fehler</span>${a.queuedForMe ? `<span><b>${a.queuedForMe}</b> in Warteschlange</span>` : ''}<span style="margin-left:auto">${ago(a.lastSeen)}</span></div>
     <div class="agent-actions">
@@ -375,6 +391,7 @@ function renderDrawer() {
         <dt>Erstellt</dt><dd>${ago(t.createdAt)}</dd>
         <dt>Dauer</dt><dd>${t.startedAt ? dur(t.startedAt, t.finishedAt) : '–'}</dd>
         <dt>ID</dt><dd class="mono selectable">${t.id}</dd>
+        ${t.projectId && projById(t.projectId) ? `<dt>Projekt</dt><dd class="clickable" data-action="proj-open" data-id="${t.projectId}"><a>${esc(projById(t.projectId).name)}</a></dd>` : ''}
         ${parent ? `<dt>Gehört zu</dt><dd class="clickable" data-action="task-open" data-id="${parent.id}"><a>${esc(parent.title)}</a></dd>` : ''}
       </dl>
       ${t.result ? `<div class="block-title flex between">Ergebnis <button class="btn btn-sm btn-ghost" data-action="copy" data-text="${esc(t.result)}">${icon('copy', 'sm')}</button></div><div class="result selectable">${esc(t.result)}</div>` : ''}
@@ -452,6 +469,7 @@ function vIntegrate() {
     ['Ziel an den Manager', `curl -s -X POST "${BASE}/api/tasks?target=manager" --data-binary "Bringe die App in den App Store."`],
     ['Vorlage mit Variablen ausführen', `curl -s -X POST ${BASE}/api/templates/<id>/run -H 'Content-Type: application/json' \\\n  -d '{"vars":{"ziel":"Release 2.0"}}'`],
     ['Auf Ergebnis warten (blockierend)', `curl -s "${BASE}/api/tasks/<id>/wait?timeout=300"`],
+    ['Projekt anlegen (Manager plant, du gibst frei)', `curl -s -X POST ${BASE}/api/projects -H 'Content-Type: application/json' \\\n  -d '{"name":"Dark Mode","goal":"Dark Mode für die ganze App","cwd":"/pfad/zum/repo"}'`],
     ['Live-Ereignisse abonnieren', `curl -N ${BASE}/api/events`],
     ['Text-Überblick (auch für Agenten)', `curl -s ${BASE}/api/overview`],
   ];
@@ -472,7 +490,7 @@ function vIntegrate() {
         <button class="btn btn-sm" data-action="hook-test" data-id="${h.id}">Test</button>
         <button class="btn btn-sm btn-icon btn-danger" data-action="hook-del" data-id="${h.id}">${icon('trash', 'sm')}</button></div>`).join('') : '<div class="faint">Noch keine Webhooks.</div>'}
       <div class="block-title">Ereignistypen</div>
-      <div class="agent-meta">${['task.created', 'task.started', 'task.progress', 'task.completed', 'task.failed', 'task.cancelled', 'agent.registered', 'agent.waiting', 'agent.offline', 'workflow.started', 'workflow.completed', 'workflow.failed'].map(e => `<span class="tag mono">${e}</span>`).join('')}</div>
+      <div class="agent-meta">${['task.created', 'task.started', 'task.progress', 'task.completed', 'task.failed', 'task.cancelled', 'agent.registered', 'agent.waiting', 'agent.offline', 'workflow.started', 'workflow.completed', 'workflow.failed', 'project.created', 'project.planned', 'project.status', 'project.part.approved', 'project.part.accepted', 'project.part.rework', 'project.completed'].map(e => `<span class="tag mono">${e}</span>`).join('')}</div>
     </div></div>
   </div>
   <div class="section-title">Beispiele</div>
@@ -512,6 +530,385 @@ function vSettings() {
     <div class="setting"><div class="txt"><b>Version</b><span>Dirigent ${esc(sv.version)} · läuft seit ${ago(sv.startedAt)}</span></div></div>
   </div></div>`;
 }
+
+/* ───────── Ansicht: Projekte ─────────
+   Manager plant Teilbereiche + Standards → du prüfst, teilst ein, gibst frei → Worker setzen um → Manager nimmt ab. */
+const PSTATUS = { planning: ['Planung', 'working'], review: ['Freigabe nötig', 'queued'], running: ['In Ausführung', 'running'], done: ['Abgeschlossen', 'done'], cancelled: ['Abgebrochen', 'cancelled'] };
+const PART = {
+  draft: ['Entwurf', 'queued'], waiting: ['Freigegeben · wartet', 'waiting'], queued: ['Freigegeben · Warteschlange', 'waiting'],
+  running: ['In Arbeit', 'running'], delivered: ['Abgeliefert', 'idle'], accepted: ['Abgenommen', 'done'],
+  failed: ['Fehler', 'failed'], cancelled: ['Abgebrochen', 'cancelled'],
+};
+const projPill = (s) => `<span class="pill ${PSTATUS[s]?.[1] || ''}">${PSTATUS[s]?.[0] || esc(s)}</span>`;
+const partPill = (s) => `<span class="pill ${PART[s]?.[1] || ''}">${PART[s]?.[0] || esc(s)}</span>`;
+const projById = (id) => (S.projects || []).find(p => p.id === id);
+const planTaskOf = (p) => [...S.tasks].reverse().find(t => t.projectId === p.id && !t.partId && t.kind === 'task');
+const planBusy = (p) => S.tasks.some(t => t.projectId === p.id && !t.partId && t.kind === 'task' && (t.status === 'queued' || t.status === 'running') && t.createdAt > (p.planSubmittedAt || 0));
+function waveOf(p, id, d = 0) {
+  const x = p.parts.find(q => q.id === id);
+  if (!x || !x.dependsOn?.length || d > 50) return 0;
+  return 1 + Math.max(...x.dependsOn.map(z => waveOf(p, z, d + 1)));
+}
+
+/** Was braucht gerade dich? */
+function projAttention(p) {
+  if (p.status === 'cancelled' || p.status === 'done') return [];
+  const out = [];
+  const drafts = p.parts.filter(x => x.status === 'draft');
+  if (drafts.length && !planBusy(p)) out.push(`${drafts.length} zur Freigabe`);
+  const unassigned = drafts.filter(x => !x.agentId).length;
+  if (unassigned && !planBusy(p)) out.push(`${unassigned} nicht eingeteilt`);
+  const delivered = p.parts.filter(x => x.status === 'delivered').length;
+  if (delivered && !agentById(p.managerId)) out.push(`${delivered} zur Abnahme`);
+  const failed = p.parts.filter(x => x.status === 'failed').length;
+  if (failed) out.push(`${failed} fehlgeschlagen`);
+  return out;
+}
+
+function projPhases(p) {
+  const has = (...st) => p.parts.some(x => st.includes(x.status));
+  const all = (...st) => p.parts.length > 0 && p.parts.every(x => st.includes(x.status));
+  const busy = planBusy(p);
+  const acc = p.parts.filter(x => x.status === 'accepted').length;
+  const steps = [
+    ['Planung', busy || !p.revision ? 'active' : 'done'],
+    ['Prüfen & Einteilen', has('draft') && !busy ? 'active' : (p.revision && !has('draft') ? 'done' : '')],
+    ['Ausführung', has('waiting', 'queued', 'running') ? 'active' : (all('delivered', 'accepted') ? 'done' : '')],
+    [p.requireReview ? 'Abnahme' : 'Abnahme (auto)', has('delivered') ? 'active' : (all('accepted') ? 'done' : '')],
+    [`Fertig · ${acc}/${p.parts.length}`, p.status === 'done' ? 'done' : ''],
+  ];
+  if (p.status === 'cancelled') steps.forEach(s => { if (s[1] === 'active') s[1] = 'failed'; });
+  return `<div class="pipeline phases">${steps.map(([l, c], i) => `${i ? '<div class="parrow"></div>' : ''}<div class="pstep ${c}"><span class="num">${c === 'done' ? '✓' : i + 1}</span>${esc(l)}</div>`).join('')}</div>`;
+}
+
+function projCard(p) {
+  const acc = p.parts.filter(x => x.status === 'accepted').length, total = p.parts.length;
+  const mgr = agentById(p.managerId);
+  const att = projAttention(p);
+  const pct = total ? Math.round(acc / total * 100) : 0;
+  return `<div class="panel proj-card clickable" data-action="proj-open" data-id="${p.id}">
+    <div class="flex between"><div class="proj-name">${esc(p.name)}</div>${projPill(p.status)}</div>
+    <div class="muted proj-goal">${esc(p.goal)}</div>
+    <div class="flex gap-s faint" style="font-size:12px">${mgr ? avatar(mgr, 'sm') + esc(mgr.name) : '👑 –'}<span>· ${p.standards.length} Standards · ${total} Teilbereiche</span></div>
+    <div class="flex"><div class="progress" style="max-width:none"><i style="width:${pct}%"></i></div><span class="faint nowrap" style="font-size:12px">${acc}/${total}</span></div>
+    ${att.length ? `<div class="attn">${icon('bell', 'sm')}<span>${esc(att.join(' · '))}</span></div>` : ''}
+  </div>`;
+}
+
+function projIntro() {
+  return `<div class="panel hero">
+    <h2>Projekte: planen, freigeben, orchestrieren 🎼</h2>
+    <p>Ein Manager-Agent zerlegt deine Aufgabe in Teilbereiche und legt sehr präzise Standards fest. Du prüfst den Plan, teilst die angemeldeten Agenten ein und gibst frei. <b>Erst nach deiner Freigabe</b> beginnt ein Worker mit seinem Teilbereich.</p>
+    <button class="btn btn-primary" data-action="proj-new">${icon('plus', 'sm')} Neues Projekt</button>
+    <div class="steps steps-4">
+      <div class="step"><div class="n">1</div><b>Manager plant</b><span>Teilbereiche mit Pfaden, Abhängigkeiten und Abnahmekriterien, dazu 15–40 Standards.</span></div>
+      <div class="step"><div class="n">2</div><b>Du prüfst & teilst ein</b><span>Prompts und Standards bearbeiten, Agenten zuweisen, Überarbeitung anfordern.</span></div>
+      <div class="step"><div class="n">3</div><b>Freigabe → Worker startet</b><span>Jeder Worker bekommt genau den freigegebenen Prompt samt allen Standards.</span></div>
+      <div class="step"><div class="n">4</div><b>Abnahme</b><span>Der Manager prüft jede Ablieferung. Nacharbeit geht zuerst wieder an dich zur Freigabe.</span></div>
+    </div>
+  </div>`;
+}
+
+function vProjects() {
+  if (ui.project) { const p = projById(ui.project); if (p) return projDetail(p); ui.project = null; }
+  const list = S.projects || [];
+  if (!list.length) return projIntro();
+  const active = list.filter(p => p.status !== 'done' && p.status !== 'cancelled').reverse();
+  const past = list.filter(p => p.status === 'done' || p.status === 'cancelled').reverse();
+  let html = active.length ? `<div class="grid grid-cards">${active.map(projCard).join('')}</div>` : '<div class="panel empty"><div class="big">🗂️</div><h3>Keine aktiven Projekte</h3><button class="btn btn-primary" data-action="proj-new">Neues Projekt</button></div>';
+  if (past.length) html += `<div class="section-title">Abgeschlossen & abgebrochen</div><div class="grid grid-cards">${past.map(projCard).join('')}</div>`;
+  return html;
+}
+
+function projDetail(p) {
+  const mgr = agentById(p.managerId);
+  const busy = planBusy(p);
+  const planTask = planTaskOf(p);
+  const drafts = p.parts.filter(x => x.status === 'draft');
+  const acc = p.parts.filter(x => x.status === 'accepted').length;
+  const managers = S.agents.filter(a => a.role === 'manager');
+  const live = p.status !== 'cancelled' && p.status !== 'done';
+  let banners = '';
+  if (busy) {
+    const who = agentById(planTask?.assignedAgentId);
+    const txt = planTask?.status === 'running' ? `<b>${esc(who?.name || 'Der Manager')}</b> plant gerade${p.revision ? ' die Überarbeitung' : ''} …`
+      : (managers.length || mgr ? 'Der Planungsauftrag wartet darauf, dass der Manager bereit ist …' : '<b>Kein Manager angemeldet.</b> Der Planungsauftrag wartet, bis sich einer meldet:');
+    banners += `<div class="banner info flex">${icon('clock', 'sm')}<span>${txt}</span>${planTask ? `<button class="btn btn-sm" style="margin-left:auto" data-action="task-open" data-id="${planTask.id}">Auftrag ansehen</button>` : ''}</div>`;
+    if (!managers.length && !mgr) banners += codeBlock(joinPrompt('manager'));
+  } else if (live && !p.parts.length) {
+    banners += `<div class="banner flex"><span>Noch kein Plan${planTask?.status === 'failed' ? ' – die Planung ist fehlgeschlagen' : ''}.</span><button class="btn btn-sm" style="margin-left:auto" data-action="proj-replan" data-id="${p.id}">Planung anfordern</button></div>`;
+  }
+  if (live && drafts.length && !busy) {
+    banners += `<div class="banner info flex">${icon('bell', 'sm')}<span><b>Du bist dran:</b> Prüfe ${drafts.length === 1 ? 'den Teilbereich' : `die ${drafts.length} Teilbereiche`} und die Standards, teile Agenten ein und gib frei. Worker starten erst nach deiner Freigabe.</span>
+      <button class="btn btn-sm btn-primary" style="margin-left:auto" data-action="proj-approve-all" data-id="${p.id}">${icon('check', 'sm')} ${drafts.length === 1 ? 'Freigeben' : `Alle ${drafts.length} freigeben`}</button></div>`;
+  }
+  const waves = {};
+  p.parts.forEach(x => { const w = waveOf(p, x.id); (waves[w] = waves[w] || []).push(x); });
+  const waveKeys = Object.keys(waves).map(Number).sort((a, b) => a - b);
+  const partsHtml = p.parts.length ? waveKeys.map(w => `<div class="wave"><div class="wave-head">Welle ${w + 1}${w === 0 ? ' · startet sofort nach Freigabe' : ' · nach Abnahme der Abhängigkeiten'}</div>
+      <div class="parts-grid">${waves[w].map(x => partCard(p, x)).join('')}</div></div>`).join('')
+    : `<div class="panel empty"><div class="big">🧩</div><h3>Noch keine Teilbereiche</h3><p>Sie erscheinen hier, sobald der Manager seinen Plan einreicht.</p></div>`;
+  const tail = [...p.log].reverse().slice(0, 60);
+  return `
+  <div class="panel proj-head">
+    <div class="flex between" style="flex-wrap:wrap;gap:8px">
+      <button class="btn btn-sm btn-ghost" data-action="proj-back">← Alle Projekte</button>
+      <div class="flex gap-s" style="flex-wrap:wrap">
+        ${live ? `<button class="btn btn-sm" data-action="proj-replan" data-id="${p.id}">${icon('refresh', 'sm')} Überarbeitung anfordern</button>` : ''}
+        <button class="btn btn-sm" data-action="proj-edit" data-id="${p.id}">${icon('edit', 'sm')} Bearbeiten</button>
+        <button class="btn btn-sm btn-icon" data-action="copy" data-text="${esc(`curl -s "${BASE}/api/projects/${p.id}?format=text"`)}" title="Text-Überblick (curl) kopieren">${icon('terminal', 'sm')}</button>
+        ${live ? `<button class="btn btn-sm btn-danger" data-action="proj-cancel" data-id="${p.id}">${icon('stop', 'sm')} Abbrechen</button>` : ''}
+        <button class="btn btn-sm btn-icon btn-danger" data-action="proj-del" data-id="${p.id}" title="Löschen">${icon('trash', 'sm')}</button>
+      </div>
+    </div>
+    <h2 class="proj-title selectable">${esc(p.name)} ${projPill(p.status)}</h2>
+    <div class="proj-goal-full selectable">${esc(p.goal)}</div>
+    <div class="proj-meta">
+      <span class="flex gap-s">👑 ${mgr ? `${avatar(mgr, 'sm')}<b>${esc(mgr.name)}</b> ${statusPill(mgr.status)}` : '<b>beliebiger Manager</b>'}</span>
+      ${p.cwd ? `<span class="mono" title="${esc(p.cwd)}">${icon('folder', 'sm')} ${esc(p.cwd.replace(/^\/Users\/[^/]+/, '~'))}</span>` : ''}
+      <span>Revision <b>${p.revision}</b></span>
+      <span>Abnahme: <b>${p.requireReview ? 'durch den Manager' : 'automatisch'}</b></span>
+      <span>seit ${ago(p.createdAt)}</span>
+    </div>
+    ${projPhases(p)}
+    <div class="flex"><div class="progress" style="max-width:none"><i style="width:${p.parts.length ? Math.round(acc / p.parts.length * 100) : 0}%"></i></div><span class="faint nowrap" style="font-size:12px">${acc}/${p.parts.length} abgenommen</span></div>
+  </div>
+  ${banners}
+  <div class="grid grid-2">
+    <div>
+      <div class="flex between" style="margin:4px 0 12px"><div class="section-title" style="margin:0">Teilbereiche (${p.parts.length})</div>
+        ${live ? `<button class="btn btn-sm" data-action="part-new" data-p="${p.id}">${icon('plus', 'sm')} Teilbereich</button>` : ''}</div>
+      ${partsHtml}
+    </div>
+    <div class="flex" style="flex-direction:column;align-items:stretch;gap:16px">
+      ${standardsPanel(p)}
+      ${p.summary ? `<div class="panel"><div class="panel-head"><h3>${icon('flow', 'sm')} Architektur & Plan</h3></div><div class="panel-body selectable" style="white-space:pre-wrap;font-size:13px;color:var(--text-2)">${esc(p.summary)}</div></div>` : ''}
+      <div class="panel"><div class="panel-head"><h3>${icon('pulse', 'sm')} Verlauf</h3></div><div class="panel-body" style="max-height:420px;overflow:auto">
+        ${tail.length ? `<div class="timeline">${tail.map(e => `<div><small>${ago(e.time)}</small>${esc(e.text)}</div>`).join('')}</div>` : '<div class="faint">Noch nichts passiert.</div>'}</div></div>
+    </div>
+  </div>`;
+}
+
+function assignOptions(x) {
+  const load = (id) => (S.projects || []).reduce((n, p) => n + p.parts.filter(q => q.agentId === id && q.id !== x.id && !['accepted', 'cancelled'].includes(q.status)).length, 0);
+  const opts = [['', '⚡ Beliebiger Worker'], ...S.agents.map(a => {
+    const n = load(a.id);
+    return [a.id, `${a.status === 'waiting' ? '🟢' : a.status === 'working' ? '🟣' : '⚪️'} ${a.name}${a.role === 'manager' ? ' 👑' : ''}${n ? ` · ${n} weitere` : ''}`];
+  })];
+  if (x.agentId && !S.agents.some(a => a.id === x.agentId)) opts.push([x.agentId, '⚠️ abgemeldeter Agent']);
+  return opts.map(([v, l]) => `<option value="${esc(v)}" ${v === (x.agentId || '') ? 'selected' : ''}>${esc(l)}</option>`).join('');
+}
+
+function partCard(p, x) {
+  const ag = agentById(x.agentId);
+  const task = S.tasks.find(t => t.id === x.taskIds?.[x.taskIds.length - 1]);
+  const open = ui.openParts.has(x.id);
+  const deps = (x.dependsOn || []).map(d => p.parts.find(q => q.id === d)).filter(Boolean);
+  const live = p.status !== 'cancelled';
+  const canAssign = live && ['draft', 'waiting', 'queued', 'failed', 'cancelled'].includes(x.status);
+  const b = (act, label, cls = '', ico = '') => `<button class="btn btn-sm ${cls}" data-action="${act}" data-p="${p.id}" data-x="${x.id}">${ico ? icon(ico, 'sm') : ''}${label}</button>`;
+  const del = `<button class="btn btn-sm btn-icon btn-danger" data-action="part-del" data-p="${p.id}" data-x="${x.id}" title="Löschen">${icon('trash', 'sm')}</button>`;
+  const btns = [];
+  if (live) {
+    if (x.status === 'draft') btns.push(b('part-approve', 'Freigeben', 'btn-primary', 'check'), b('part-edit', 'Bearbeiten', '', 'edit'), b('part-preview', 'Worker-Prompt', '', 'terminal'), del);
+    if (x.status === 'waiting' || x.status === 'queued') btns.push(b('part-unapprove', 'Freigabe zurückziehen', '', 'stop'));
+    if (x.status === 'delivered') btns.push(b('part-accept', 'Abnehmen', 'btn-primary', 'check'), b('part-rework', 'Nacharbeit', '', 'refresh'));
+    if (x.status === 'failed' || x.status === 'cancelled') btns.push(b('part-rework', 'Nacharbeit', '', 'refresh'), b('part-accept', 'Trotzdem abnehmen'), del);
+    if (x.status === 'accepted') btns.push(b('part-rework', 'Nacharbeit', 'btn-ghost', 'refresh'));
+  }
+  if (task) btns.push(`<button class="btn btn-sm btn-ghost" data-action="task-open" data-id="${task.id}">Auftrag →</button>`);
+  const blockers = x.status === 'waiting' ? deps.filter(d => d.status !== 'accepted') : [];
+  const lastProg = task?.status === 'running' && task.progress?.length ? task.progress[task.progress.length - 1].text : '';
+  return `<div class="part-card ps-${x.status}">
+    <div class="part-top"><span class="part-key mono">${esc(x.key)}</span><div class="part-name">${esc(x.name)}${x.round > 1 ? ` <span class="pill idle">Runde ${x.round}</span>` : ''}</div>${partPill(x.status)}</div>
+    ${x.goal ? `<div class="part-goal">${esc(x.goal)}</div>` : ''}
+    ${x.status === 'running' ? '<div class="working-bar"></div>' : ''}
+    ${lastProg ? `<div class="faint" style="font-size:12px">📝 ${esc(lastProg)}</div>` : ''}
+    <div class="part-assign"><span class="faint">Agent</span>
+      ${canAssign ? `<select class="select sm" data-assign="${x.id}" data-p="${p.id}">${assignOptions(x)}</select>` : (ag ? `<span class="flex gap-s">${avatar(ag, 'sm')}${esc(ag.name)}</span>` : `<span class="faint">${task?.assignedAgentId ? esc(agentById(task.assignedAgentId)?.name || '–') : 'beliebiger Worker'}</span>`)}
+      ${x.suggestedAgent && x.status === 'draft' && (!ag || ag.name.toLowerCase() !== x.suggestedAgent.toLowerCase()) ? `<span class="faint" style="font-size:11.5px">Vorschlag des Managers: ${esc(x.suggestedAgent)}</span>` : ''}
+    </div>
+    <div class="agent-meta">
+      ${x.paths.map(s => `<span class="tag mono">${esc(s)}</span>`).join('')}
+      ${deps.length ? `<span class="tag">⤷ nach ${deps.map(d => esc(d.key)).join(', ')}</span>` : ''}
+      <span class="tag">✓ ${x.acceptance.length} Kriterien</span>
+    </div>
+    ${blockers.length ? `<div class="faint" style="font-size:12px">⏳ Startet, sobald ${blockers.map(d => `„${esc(d.name)}“`).join(', ')} abgenommen ${blockers.length > 1 ? 'sind' : 'ist'}.</div>` : ''}
+    ${x.note && x.status === 'draft' && x.round > 1 ? `<div class="part-note">🔁 <b>Nacharbeit:</b> ${esc(x.note)}</div>` : ''}
+    ${open ? partDetails(x) : ''}
+    <div class="part-actions">${btns.join('')}<button class="btn btn-sm btn-ghost" style="margin-left:auto" data-action="part-toggle" data-x="${x.id}">${open ? 'Weniger ▴' : 'Details ▾'}</button></div>
+  </div>`;
+}
+
+function partDetails(x) {
+  return `<div class="part-details">
+    <div class="block-title">Prompt des Managers</div><div class="tpl-prompt selectable" style="max-height:none">${esc(x.prompt)}</div>
+    ${x.acceptance.length ? `<div class="block-title">Abnahmekriterien</div><ol class="crit selectable">${x.acceptance.map(a => `<li>${esc(a)}</li>`).join('')}</ol>` : ''}
+    ${x.tags.length ? `<div class="block-title">Tags</div><div class="agent-meta">${x.tags.map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div>` : ''}
+    ${x.note ? `<div class="block-title">Notiz</div><div class="muted selectable" style="font-size:13px;white-space:pre-wrap">${esc(x.note)}</div>` : ''}
+    ${x.result ? `<div class="block-title">${x.status === 'failed' ? 'Fehler' : 'Ergebnis'}</div><div class="result ${x.status === 'failed' ? 'err' : ''} selectable">${esc(x.result)}</div>` : ''}
+  </div>`;
+}
+
+function standardsPanel(p) {
+  const cats = [...new Set(p.standards.map(s => s.category))];
+  const must = p.standards.filter(s => s.mandatory).length;
+  const live = p.status !== 'cancelled' && p.status !== 'done';
+  return `<div class="panel"><div class="panel-head"><h3>${icon('shield', 'sm')} Standards <span class="faint" style="font-weight:500">${p.standards.length} · ${must} MUSS</span></h3>
+    ${live ? `<button class="btn btn-sm" data-action="std-edit" data-p="${p.id}">${icon('plus', 'sm')} Standard</button>` : ''}</div>
+    <div class="panel-body std-body">${p.standards.length ? cats.map(c => `<div class="std-cat">${esc(c)}</div>${p.standards.filter(s => s.category === c).map(s => `
+      <div class="std" ${live ? `data-action="std-edit" data-p="${p.id}" data-s="${s.id}"` : ''}><span class="std-lvl ${s.mandatory ? 'must' : 'should'}">${s.mandatory ? 'MUSS' : 'SOLL'}</span>
+        <div style="min-width:0"><b>${esc(s.id)} · ${esc(s.title)}</b>${s.rule !== s.title ? `<div class="muted selectable">${esc(s.rule)}</div>` : ''}</div></div>`).join('')}`).join('')
+      : '<div class="faint">Noch keine Standards – der Manager legt sie beim Planen fest. Du kannst selbst welche ergänzen.</div>'}
+    <div class="faint" style="font-size:11.5px;margin-top:12px">Jeder Worker erhält bei der Freigabe alle Standards. Änderungen gelten für alle noch nicht freigegebenen Teilbereiche.</div></div></div>`;
+}
+
+/* Projekt-Modals */
+function projModal(id) {
+  const p = projById(id) || { name: '', goal: '', cwd: '', managerId: '', requireReview: true };
+  const mgrs = S.agents.filter(a => a.role === 'manager'), rest = S.agents.filter(a => a.role !== 'manager');
+  const cur = p.managerId || (mgrs.length === 1 ? mgrs[0].id : '');
+  const opts = [['', '👑 Beliebiger Manager'], ...mgrs.map(a => [a.id, `👑 ${a.name}`]), ...rest.map(a => [a.id, `${a.name} (Worker)`])];
+  const cwds = [...new Set(S.agents.map(a => a.cwd).filter(Boolean))];
+  modal(`<div class="modal-head"><h2>${id ? 'Projekt bearbeiten' : 'Neues Projekt'}</h2><button class="btn btn-icon btn-ghost" data-action="modal-close">${icon('x')}</button></div>
+  <div class="modal-body">
+    ${id ? '' : `<div class="banner info"><b>1</b> Manager plant Teilbereiche & Standards → <b>2</b> du prüfst, teilst ein, gibst frei → <b>3</b> erst dann starten die Worker → <b>4</b> Manager nimmt jede Ablieferung ab.</div>`}
+    <div class="field"><label>Name</label><input class="input" id="pjName" value="${esc(p.name)}" placeholder="z. B. Dark Mode für die iPad-App" autofocus></div>
+    <div class="field"><label>Aufgabe / Ziel für den Manager</label><textarea class="textarea" id="pjGoal" style="min-height:150px" placeholder="Was soll am Ende stehen? Rahmenbedingungen, Wünsche, No-Gos …">${esc(p.goal)}</textarea></div>
+    <div class="field"><label>Arbeitsverzeichnis (Repository)</label><input class="input mono" id="pjCwd" list="pjCwds" value="${esc(p.cwd)}" placeholder="/Users/…/Developer/MeinProjekt">
+      <datalist id="pjCwds">${cwds.map(c => `<option value="${esc(c)}">`).join('')}</datalist><span class="hint">Wird dem Manager und allen Workern mitgegeben.</span></div>
+    <div class="field"><label>Manager (plant und nimmt ab)</label><div class="target-grid" data-picker="pjMgr">${opts.map(([v, l]) => `<button type="button" class="target-opt ${v === cur ? 'active' : ''}" data-action="pick" data-v="${esc(v)}">${esc(l)}</button>`).join('')}</div>
+      <input type="hidden" id="pjMgr" value="${esc(cur)}">
+      ${!mgrs.length ? `<span class="hint">Noch kein Manager angemeldet – so meldest du einen an (Prompt in eine Claude-Code-Session einfügen):</span>${codeBlock(joinPrompt('manager'))}` : ''}</div>
+    <div class="setting"><div class="txt"><b>Abnahme durch den Manager</b><span>Jede Ablieferung wird vom Manager gegen Kriterien und Standards geprüft, bevor abhängige Teilbereiche starten. Aus: Ablieferung gilt sofort als abgenommen.</span></div>
+      <label class="switch"><input type="checkbox" id="pjReview" ${p.requireReview ? 'checked' : ''}><span></span></label></div>
+  </div>
+  <div class="modal-foot"><button class="btn" data-action="modal-close">Abbrechen</button><button class="btn btn-primary" data-action="proj-save" data-id="${id || ''}">${icon(id ? 'check' : 'send', 'sm')} ${id ? 'Speichern' : 'Anlegen & Planung anfordern'}</button></div>`, 'wide');
+}
+
+function partModal(pid, xid) {
+  const p = projById(pid); if (!p) return;
+  const x = p.parts.find(q => q.id === xid) || { name: '', goal: '', prompt: '', acceptance: [], paths: [], tags: [], dependsOn: [], agentId: '' };
+  const others = p.parts.filter(q => q.id !== xid);
+  modal(`<div class="modal-head"><h2>${xid ? `Teilbereich bearbeiten` : 'Neuer Teilbereich'}</h2><button class="btn btn-icon btn-ghost" data-action="modal-close">${icon('x')}</button></div>
+  <div class="modal-body">
+    <div class="row"><div class="field"><label>Name</label><input class="input" id="xName" value="${esc(x.name)}" autofocus></div>
+      <div class="field"><label>Agent</label><select class="select" id="xAgent">${assignOptions(x)}</select></div></div>
+    <div class="field"><label>Ziel (ein Satz)</label><input class="input" id="xGoal" value="${esc(x.goal)}"></div>
+    <div class="field"><label>Prompt für den Worker</label><textarea class="textarea" id="xPrompt" style="min-height:190px">${esc(x.prompt)}</textarea>
+      <span class="hint">Projektziel, alle Standards, Abnahmekriterien und Ergebnisse der Abhängigkeiten fügt Dirigent bei der Freigabe automatisch hinzu.</span></div>
+    <div class="row"><div class="field"><label>Abnahmekriterien (eins pro Zeile)</label><textarea class="textarea" id="xAcc" style="min-height:110px">${esc(x.acceptance.join('\n'))}</textarea></div>
+      <div class="field"><label>Pfade / Zuständigkeit (eins pro Zeile)</label><textarea class="textarea mono" id="xPaths" style="min-height:110px">${esc(x.paths.join('\n'))}</textarea></div></div>
+    <div class="row"><div class="field"><label>Tags (kommagetrennt)</label><input class="input" id="xTags" value="${esc(x.tags.join(', '))}"></div>
+      <div class="field"><label>Startet nach (Abhängigkeiten)</label>${others.length ? `<div class="dep-list">${others.map(o => `<label><input type="checkbox" data-dep="${o.id}" ${x.dependsOn.includes(o.id) ? 'checked' : ''}> <span class="mono">${esc(o.key)}</span> ${esc(o.name)}</label>`).join('')}</div>` : '<span class="faint">keine anderen Teilbereiche</span>'}</div></div>
+  </div>
+  <div class="modal-foot"><button class="btn" data-action="modal-close">Abbrechen</button><button class="btn btn-primary" data-action="part-save" data-p="${pid}" data-x="${xid || ''}">${icon('check', 'sm')} Speichern</button></div>`, 'wide');
+}
+
+function stdModal(pid, sid) {
+  const p = projById(pid); if (!p) return;
+  const s = p.standards.find(q => q.id === sid) || { category: '', title: '', rule: '', mandatory: true };
+  const cats = [...new Set(p.standards.map(q => q.category).concat(['Architektur', 'Schnittstellen', 'Code-Stil', 'Fehlerbehandlung', 'Tests', 'Sicherheit', 'Performance', 'UI/UX', 'Dokumentation', 'Git & Commits']))];
+  modal(`<div class="modal-head"><h2>${sid ? `Standard ${esc(sid)}` : 'Neuer Standard'}</h2><button class="btn btn-icon btn-ghost" data-action="modal-close">${icon('x')}</button></div>
+  <div class="modal-body">
+    <div class="row"><div class="field"><label>Kategorie</label><input class="input" id="sCat" list="sCats" value="${esc(s.category)}" placeholder="z. B. Tests"><datalist id="sCats">${cats.map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
+      <div class="field" style="max-width:150px"><label>Verbindlichkeit</label><select class="select" id="sLvl"><option value="1" ${s.mandatory ? 'selected' : ''}>MUSS</option><option value="0" ${!s.mandatory ? 'selected' : ''}>SOLL</option></select></div></div>
+    <div class="field"><label>Titel</label><input class="input" id="sTitle" value="${esc(s.title)}" autofocus></div>
+    <div class="field"><label>Regel (konkret und prüfbar)</label><textarea class="textarea" id="sRule" style="min-height:120px">${esc(s.rule)}</textarea></div>
+  </div>
+  <div class="modal-foot">${sid ? `<button class="btn btn-danger" style="margin-right:auto" data-action="std-del" data-p="${pid}" data-s="${sid}">${icon('trash', 'sm')} Löschen</button>` : ''}<button class="btn" data-action="modal-close">Abbrechen</button><button class="btn btn-primary" data-action="std-save" data-p="${pid}" data-s="${sid || ''}">${icon('check', 'sm')} Speichern</button></div>`);
+}
+
+/** Einfaches Eingabe-Modal (Rückmeldung, Nacharbeit, Abnahme-Notiz). */
+function askModal({ title, label, placeholder = '', hint = '', ok = 'OK', required = false, onOk }) {
+  ui.ask = { onOk, required };
+  modal(`<div class="modal-head"><h2>${esc(title)}</h2><button class="btn btn-icon btn-ghost" data-action="modal-close">${icon('x')}</button></div>
+  <div class="modal-body"><div class="field"><label>${esc(label)}</label><textarea class="textarea" id="askText" autofocus style="min-height:140px" placeholder="${esc(placeholder)}"></textarea>${hint ? `<span class="hint">${hint}</span>` : ''}</div></div>
+  <div class="modal-foot"><button class="btn" data-action="modal-close">Abbrechen</button><button class="btn btn-primary" data-action="ask-ok">${esc(ok)}</button></div>`);
+}
+
+const projActions = {
+  'proj-new': () => projModal(),
+  'proj-open': (el) => { closeDrawer(); closeModal(); ui.view = 'projects'; ui.project = el.dataset.id; try { localStorage.setItem('dirigent.view', 'projects'); } catch {} render(); $('#view').scrollTop = 0; },
+  'proj-back': () => { ui.project = null; render(); $('#view').scrollTop = 0; },
+  'proj-edit': (el) => projModal(el.dataset.id),
+  'proj-save': async (el) => {
+    const body = { name: $('#pjName').value.trim(), goal: $('#pjGoal').value.trim(), cwd: $('#pjCwd').value.trim(), manager: $('#pjMgr').value, requireReview: $('#pjReview').checked, createdBy: 'user' };
+    if (!body.goal) { $('#pjGoal').focus(); return; }
+    try {
+      if (el.dataset.id) { await api('PATCH', `/api/projects/${el.dataset.id}`, body); closeModal(); toast('🗂️', 'Projekt gespeichert'); }
+      else { const p = await api('POST', '/api/projects', body); closeModal(); ui.view = 'projects'; ui.project = p.id; toast('📨', 'Projekt angelegt – Planung beim Manager angefordert'); refreshSoon(); }
+    } catch (e) { toast('⚠️', e.message); }
+  },
+  'proj-replan': (el) => askModal({
+    title: 'Überarbeitung anfordern', label: 'Rückmeldung an den Manager', ok: 'An Manager senden',
+    placeholder: 'Was soll anders werden? z. B. „Teilbereich UI aufteilen“, „Standards für Barrierefreiheit ergänzen“ …',
+    hint: 'Der Manager erhält den aktuellen Plan samt deiner Rückmeldung. Bereits freigegebene Teilbereiche bleiben unverändert.',
+    onOk: async (v) => { await api('POST', `/api/projects/${el.dataset.id}/replan?format=json`, { feedback: v, createdBy: 'user' }); toast('📨', 'Überarbeitung angefordert'); },
+  }),
+  'proj-approve-all': async (el) => {
+    try { const r = await api('POST', `/api/projects/${el.dataset.id}/approve?format=json`, {}); toast('✅', `${r.approved} Teilbereich(e) freigegeben`); (r.errors || []).forEach(e => toast('⚠️', e)); } catch (e) { toast('⚠️', e.message); }
+  },
+  'proj-cancel': async (el) => { if (!(await confirmAsk('Projekt abbrechen? Laufende Aufträge werden abgebrochen.'))) return; await api('POST', `/api/projects/${el.dataset.id}/cancel?format=json`).catch(e => toast('⚠️', e.message)); },
+  'proj-del': async (el) => { if (!(await confirmAsk('Projekt endgültig löschen? Laufende Aufträge werden abgebrochen.'))) return; await api('DELETE', `/api/projects/${el.dataset.id}`); ui.project = null; render(); },
+  'part-toggle': (el) => { const id = el.dataset.x; ui.openParts.has(id) ? ui.openParts.delete(id) : ui.openParts.add(id); render(); },
+  'part-approve': async (el) => { try { await api('POST', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}/approve?format=json`, {}); toast('✅', 'Freigegeben – der Worker erhält jetzt seinen Auftrag'); } catch (e) { toast('⚠️', e.message); } },
+  'part-unapprove': async (el) => { try { await api('POST', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}/unapprove?format=json`, {}); toast('↩︎', 'Freigabe zurückgezogen'); } catch (e) { toast('⚠️', e.message); } },
+  'part-accept': (el) => askModal({
+    title: 'Teilbereich abnehmen', label: 'Notiz (optional)', ok: 'Abnehmen',
+    hint: 'Abhängige, bereits freigegebene Teilbereiche starten danach automatisch.',
+    onOk: async (v) => { await api('POST', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}/accept?format=json`, { note: v, createdBy: 'user' }); toast('🏅', 'Abgenommen'); },
+  }),
+  'part-rework': (el) => askModal({
+    title: 'Nacharbeit anfordern', label: 'Was genau muss nachgebessert werden?', ok: 'Nacharbeit anlegen', required: true,
+    placeholder: 'Konkrete, prüfbare Punkte …',
+    hint: 'Der Teilbereich geht zurück in den Entwurf. Nach deiner erneuten Freigabe erhält der Worker den Prompt plus diese Notiz und sein vorheriges Ergebnis.',
+    onOk: async (v) => { await api('POST', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}/rework?format=json`, { note: v }); toast('🔁', 'Nacharbeit angelegt – bitte freigeben, wenn sie passt'); },
+  }),
+  'part-new': (el) => partModal(el.dataset.p),
+  'part-edit': (el) => partModal(el.dataset.p, el.dataset.x),
+  'part-save': async (el) => {
+    const lines = (s) => s.split('\n').map(v => v.trim()).filter(Boolean);
+    const body = {
+      name: $('#xName').value.trim(), goal: $('#xGoal').value.trim(), prompt: $('#xPrompt').value.trim(), agentId: $('#xAgent').value,
+      acceptance: lines($('#xAcc').value), paths: lines($('#xPaths').value), tags: $('#xTags').value.split(',').map(s => s.trim()).filter(Boolean),
+      dependsOn: [...document.querySelectorAll('[data-dep]')].filter(c => c.checked).map(c => c.dataset.dep),
+    };
+    if (!body.name) { $('#xName').focus(); return; }
+    try {
+      if (el.dataset.x) await api('PATCH', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}?format=json`, body);
+      else await api('POST', `/api/projects/${el.dataset.p}/parts?format=json`, body);
+      closeModal(); toast('🧩', 'Teilbereich gespeichert');
+    } catch (e) { toast('⚠️', e.message); }
+  },
+  'part-del': async (el) => { if (!(await confirmAsk('Teilbereich löschen?'))) return; await api('DELETE', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}`).catch(e => toast('⚠️', e.message)); },
+  'part-preview': async (el) => {
+    try {
+      const txt = await api('GET', `/api/projects/${el.dataset.p}/parts/${el.dataset.x}?format=text`);
+      modal(`<div class="modal-head"><h2>Worker-Prompt (Vorschau)</h2><button class="btn btn-icon btn-ghost" data-action="modal-close">${icon('x')}</button></div>
+        <div class="modal-body"><p class="muted" style="margin-top:0">Genau diesen Auftrag erhält der Worker nach deiner Freigabe – inklusive aller Standards, Kriterien und der Ergebnisse seiner Abhängigkeiten.</p>
+        <div class="code selectable" style="white-space:pre-wrap;max-height:60vh;overflow:auto">${esc(txt)}<button class="btn btn-sm copy" data-action="copy" data-text="${esc(txt)}">${icon('copy', 'sm')}</button></div></div>
+        <div class="modal-foot"><button class="btn" data-action="modal-close">Schließen</button><button class="btn btn-primary" data-action="part-approve" data-p="${el.dataset.p}" data-x="${el.dataset.x}">${icon('check', 'sm')} Freigeben</button></div>`, 'wide');
+    } catch (e) { toast('⚠️', e.message); }
+  },
+  'std-edit': (el) => stdModal(el.dataset.p, el.dataset.s),
+  'std-save': async (el) => {
+    const body = { category: $('#sCat').value.trim() || 'Allgemein', title: $('#sTitle').value.trim(), rule: $('#sRule').value.trim(), mandatory: $('#sLvl').value === '1' };
+    if (!body.rule && !body.title) { $('#sRule').focus(); return; }
+    if (!body.rule) body.rule = body.title;
+    try {
+      if (el.dataset.s) await api('PATCH', `/api/projects/${el.dataset.p}/standards/${el.dataset.s}`, body);
+      else await api('POST', `/api/projects/${el.dataset.p}/standards`, body);
+      closeModal(); toast('🛡️', 'Standard gespeichert');
+    } catch (e) { toast('⚠️', e.message); }
+  },
+  'std-del': async (el) => { await api('DELETE', `/api/projects/${el.dataset.p}/standards/${el.dataset.s}`).catch(e => toast('⚠️', e.message)); closeModal(); },
+  'ask-ok': async () => {
+    const v = $('#askText').value.trim();
+    if (ui.ask?.required && !v) { $('#askText').focus(); return; }
+    try { await ui.ask.onOk(v); closeModal(); } catch (e) { toast('⚠️', e.message); }
+  },
+};
 
 /* ───────── Modals ───────── */
 function modal(html, cls = '') {
@@ -654,7 +1051,7 @@ async function confirmAsk(msg) { return window.confirm(msg); }
 
 /* ───────── Aktionen ───────── */
 const actions = {
-  nav: (el) => { ui.view = el.dataset.view; try { localStorage.setItem('dirigent.view', ui.view); } catch {} closeDrawer(); render(); $('#view').scrollTop = 0; },
+  nav: (el) => { ui.view = el.dataset.view; ui.project = null; try { localStorage.setItem('dirigent.view', ui.view); } catch {} closeDrawer(); render(); $('#view').scrollTop = 0; },
   join: () => joinModal(),
   compose: () => composeModal(),
   copy: (el) => copy(el.dataset.text),
@@ -717,6 +1114,7 @@ const actions = {
   },
   'set-key': async () => { await api('POST', '/api/settings/apikey', {}); toast('🔑', 'Neuer API-Key erzeugt'); },
   'clear-key': async () => { await api('POST', '/api/settings/apikey', { clear: true }); },
+  ...projActions,
 };
 function syncWf() {
   document.querySelectorAll('[data-step]').forEach(el => {
@@ -736,6 +1134,11 @@ document.addEventListener('change', async (ev) => {
   if (el.dataset.action === 'hook-toggle') await api('PATCH', `/api/webhooks/${el.dataset.id}`, { active: el.checked });
   if (el.dataset.action === 'set-lan') { await api('PUT', '/api/settings', { lanAccess: el.checked }); toast('🌐', el.checked ? 'Netzwerkzugriff aktiviert' : 'Nur noch lokal erreichbar'); setTimeout(refresh, 1200); }
   if (el.dataset.action === 'set-notify') await api('PUT', '/api/settings', { notifications: el.checked });
+  if (el.dataset.assign) {
+    el.blur();
+    try { await api('PATCH', `/api/projects/${el.dataset.p}/parts/${el.dataset.assign}?format=json`, { agentId: el.value }); toast('📌', `Eingeteilt: ${el.value ? agentById(el.value)?.name : 'beliebiger Worker'}`); }
+    catch (e) { toast('⚠️', e.message); refresh(); }
+  }
   if (el.id === 'setTheme') applyTheme(el.value, true);
 });
 document.addEventListener('input', (ev) => {
@@ -744,6 +1147,7 @@ document.addEventListener('input', (ev) => {
 document.addEventListener('keydown', (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 'k') { ev.preventDefault(); composeModal(); }
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter' && $('#cPrompt')) { ev.preventDefault(); composeSend(); }
+  if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter' && $('#askText')) { ev.preventDefault(); actions['ask-ok'](); }
   if (ev.key === 'Escape') { if ($('#modalRoot').innerHTML) closeModal(); else closeDrawer(); }
 });
 
@@ -760,6 +1164,6 @@ function applyTheme(v, save) {
   try { docs = (await api('GET', '/api/docs')).endpoints; } catch {}
   await refresh();
   connectEvents();
-  setInterval(() => { if (ui.view === 'overview' || ui.view === 'agents' || ui.view === 'tasks') refreshSoon(); }, 15000);
+  setInterval(() => { if (['overview', 'agents', 'tasks', 'projects'].includes(ui.view)) refreshSoon(); }, 15000);
   new MutationObserver(() => { const sel = $('#setTheme'); if (sel && !sel.dataset.init) { sel.dataset.init = 1; try { sel.value = localStorage.getItem('dirigent.theme') || ''; } catch {} } }).observe($('#view'), { childList: true });
 })();

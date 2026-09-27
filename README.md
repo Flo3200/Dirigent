@@ -12,6 +12,7 @@ Jede Claude-Code-Session (oder jedes andere Programm, das HTTP spricht) meldet s
 - **Token-freies Warten:** Der Agent startet einen Long-Poll-`curl` im Hintergrund (`run_in_background`). Claude Code weckt ihn erst, wenn der Befehl endet, also wenn ein Auftrag da ist.
 - **Vorlagen:** vorgefertigte Aufgaben mit `{{variablen}}`, optional mit Zeitplan (alle *n* Minuten)
 - **Workflows:** mehrstufige Abläufe (`{{input}}`, `{{prev}}`, `{{step1}}` …), z. B. *Bauen → Prüfen → Fixen*
+- **Projekte mit Freigabe:** Ein Manager zerlegt eine Aufgabe in Teilbereiche und legt sehr präzise Standards fest. Du prüfst den Plan, teilst Agenten ein und gibst frei. **Erst nach deiner Freigabe** erhält ein Worker seinen Auftrag. Der Manager nimmt jede Ablieferung ab (siehe unten).
 - **Manager-Rolle:** Ein angemeldeter Agent kann zum Manager ernannt werden. Er bekommt Ziele, sieht alle Agenten, delegiert Teilaufträge und wird bei jeder Rückmeldung automatisch geweckt.
 - **Zielsteuerung:** `any` · `manager` · `all` · `agent:<name>` · `tag:<tag>` · Prioritäten
 - **Offen integrierbar:** REST-API, Server-Sent Events (`/api/events`), Webhooks, Text-Endpunkte für Agenten, API-Key, optionaler WLAN-Zugriff (z. B. vom iPad)
@@ -52,6 +53,31 @@ Die Daten liegen unter `~/Library/Application Support/Dirigent/db.json`.
 
 > **Hinweis zu Tokens:** Während des Wartens fallen keine Tokens an. Jeder Auftrag kostet normal, denn beim Aufwachen liest das Modell den (gecachten) Session-Kontext.
 
+## Projekte: Manager plant → du gibst frei → Worker setzen um
+
+```
+ 1 Planung        Manager analysiert das Repo und reicht per curl einen Plan ein:
+                  Standards (MUSS/SOLL, nach Kategorien) + Teilbereiche mit Prompt,
+                  Pfaden, Abhängigkeiten, Abnahmekriterien, Agent-Vorschlag
+ 2 Prüfen         Du bearbeitest Prompts und Standards, teilst Agenten ein, forderst
+                  bei Bedarf eine Überarbeitung an – nichts läuft ohne dich
+ 3 Freigabe       Pro Teilbereich oder „Alle freigeben“. Der Worker bekommt genau den
+                  freigegebenen Prompt plus alle Standards, Kriterien und die Ergebnisse
+                  seiner Abhängigkeiten. Abhängige Teilbereiche starten in Wellen.
+ 4 Abnahme        Der Manager wird bei jeder Ablieferung geweckt und nimmt ab oder
+                  fordert Nacharbeit an – Nacharbeit braucht wieder deine Freigabe.
+```
+
+- Dashboard → **Projekte**: Phasenanzeige, „Du bist dran“-Hinweise, Teilbereiche nach Wellen, Einteilung per Auswahlfeld, Vorschau des Worker-Prompts, Standards-Katalog, Verlauf.
+- Der Plan wird geprüft: Zyklen und unbekannte Abhängigkeiten werden abgelehnt, überlappende Pfade paralleler Teilbereiche und zu wenige Standards gemeldet.
+- Nach der Freigabe ist der Inhalt eines Teilbereichs gesperrt. Was freigegeben ist, ist genau das, was der Worker erhält.
+
+```bash
+curl -s -X POST http://127.0.0.1:7777/api/projects -H 'Content-Type: application/json' \
+  -d '{"name":"Dark Mode","goal":"Dark Mode für die ganze App","cwd":"/pfad/zum/repo"}'
+curl -s "http://127.0.0.1:7777/api/projects/<id>?format=text"     # Überblick als Text
+```
+
 ## API (Auszug)
 
 | Methode | Pfad | Zweck |
@@ -64,6 +90,9 @@ Die Daten liegen unter `~/Library/Application Support/Dirigent/db.json`.
 | GET | `/api/tasks/:id/wait` | Blockieren, bis ein Auftrag fertig ist |
 | POST | `/api/templates/:id/run` | Vorlage ausführen (`vars`) |
 | POST | `/api/workflows/:id/run` | Workflow starten (`input`) |
+| POST | `/api/projects` | Projekt anlegen, Planung beim Manager anfordern |
+| POST | `/api/projects/:id/plan` | Manager reicht Plan ein (Standards + Teilbereiche) |
+| POST | `/api/projects/:id/parts/:pid/approve` · `accept` · `rework` | Freigeben · Abnehmen · Nacharbeit |
 | GET | `/api/events` | Live-Ereignisse (SSE) |
 | GET | `/api/state` · `/api/overview` · `/api/docs` | Zustand · Text-Überblick · alle Endpunkte |
 

@@ -12,7 +12,7 @@ struct HubSummary {
 
 /// Zentraler Zustand der Plattform. Alle Zugriffe laufen über `queue`.
 final class Hub {
-    static let version = "1.0.0"
+    static let version = "1.1.0"
 
     let queue = DispatchQueue(label: "dirigent.hub")
     let server: HTTPServer
@@ -264,6 +264,7 @@ final class Hub {
         }
         for j in db.tasks.indices where db.tasks[j].assignedAgentId == a.id && db.tasks[j].status == "running" {
             db.tasks[j].status = "queued"; db.tasks[j].assignedAgentId = nil; db.tasks[j].startedAt = nil
+            projectTaskChanged(db.tasks[j])
         }
         db.agents.remove(at: i)
         emit("agent.removed", "\(a.name) wurde entfernt", ref: a.id)
@@ -333,7 +334,8 @@ final class Hub {
     @discardableResult
     func createTasks(prompt: String, title: String?, target rawTarget: String, createdBy: String,
                      parentId: String? = nil, notifyAgentId: String? = nil, templateId: String? = nil,
-                     runId: String? = nil, stepIndex: Int? = nil, priority: Int = 0, kind: String = "task") -> Result<[TaskItem], HubError> {
+                     runId: String? = nil, stepIndex: Int? = nil, priority: Int = 0, kind: String = "task",
+                     projectId: String? = nil, partId: String? = nil) -> Result<[TaskItem], HubError> {
         let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return .failure(.msg("Prompt fehlt")) }
         let target = resolveTarget(rawTarget)
@@ -359,7 +361,7 @@ final class Hub {
                              assignedAgentId: nil, result: nil, error: nil, progress: [], createdAt: nowMs(),
                              startedAt: nil, finishedAt: nil, createdBy: createdBy, parentId: parentId,
                              notifyAgentId: notifyAgentId, templateId: templateId, runId: runId, stepIndex: stepIndex,
-                             priority: priority, kind: kind)
+                             priority: priority, kind: kind, projectId: projectId, partId: partId)
             db.tasks.append(t)
             created.append(t)
             emit("task.created", "Neuer Auftrag: \(t.title) → \(targetLabel(tg))", ref: t.id, data: toJSONObject(t))
@@ -438,9 +440,11 @@ final class Hub {
             guard let self = self, !ok, let j = self.db.tasks.firstIndex(where: { $0.id == taskId }), self.db.tasks[j].status == "running" else { return }
             // Zustellung fehlgeschlagen → zurück in die Warteschlange
             self.db.tasks[j].status = "queued"; self.db.tasks[j].assignedAgentId = nil; self.db.tasks[j].startedAt = nil
+            self.projectTaskChanged(self.db.tasks[j])
             self.changed()
         }
         emit("task.started", "\(agent.name) arbeitet an: \(t.title)", ref: t.id, data: toJSONObject(t))
+        projectTaskChanged(t)
     }
 
     /// Blockiert eine Verbindung, bis der Auftrag abgeschlossen ist.
@@ -514,6 +518,7 @@ final class Hub {
         }
         resolveTaskWaiters(t)
         if let runId = t.runId { advanceRun(runId, finished: t) }
+        projectTaskChanged(t)
         dispatch()
         return .success(t)
     }
@@ -525,6 +530,7 @@ final class Hub {
         db.tasks[i].finishedAt = nowMs()
         emit("task.cancelled", "Abgebrochen: \(db.tasks[i].title)", ref: id)
         resolveTaskWaiters(db.tasks[i])
+        projectTaskChanged(db.tasks[i])
         if let r = db.tasks[i].runId, let ri = db.runs.firstIndex(where: { $0.id == r }), db.runs[ri].status == "running" {
             db.runs[ri].status = "cancelled"; db.runs[ri].finishedAt = nowMs()
         }
@@ -541,6 +547,7 @@ final class Hub {
         db.tasks[i].finishedAt = nil
         db.tasks[i].progress = []
         emit("task.retried", "Erneut eingereiht: \(db.tasks[i].title)", ref: id)
+        projectTaskChanged(db.tasks[i])
         dispatch()
         return .success(db.tasks[i])
     }
@@ -646,6 +653,7 @@ final class Hub {
             "workflows": db.workflows.map { toJSONObject($0) },
             "runs": db.runs.suffix(100).map { toJSONObject($0) },
             "webhooks": db.webhooks.map { toJSONObject($0) },
+            "projects": db.projects.map { toJSONObject($0) },
             "events": db.events.suffix(200).map { toJSONObject($0) },
             "settings": settings,
             "server": [

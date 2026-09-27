@@ -50,6 +50,9 @@ struct TaskItem: Codable {
     var stepIndex: Int?
     var priority: Int
     var kind: String            // task | notification
+    /// Gehört zu einem Projekt: Planungsauftrag (partId == nil) oder freigegebener Teilbereich.
+    var projectId: String? = nil
+    var partId: String? = nil
 }
 
 struct Template: Codable {
@@ -93,6 +96,60 @@ struct WorkflowRun: Codable {
     var finishedAt: Double?
 }
 
+/// Verbindliche Regel, die der Manager für ein Projekt festlegt. Jeder Worker erhält alle Standards.
+struct ProjectStandard: Codable {
+    var id: String
+    var category: String
+    var title: String
+    var rule: String
+    var mandatory: Bool         // true = MUSS, false = SOLL
+}
+
+/// Teilbereich eines Projekts, den genau ein Agent bearbeitet.
+struct ProjectPart: Codable {
+    var id: String
+    var key: String             // Kurzname aus dem Plan, für Abhängigkeiten
+    var name: String
+    var goal: String
+    var prompt: String
+    var acceptance: [String]
+    var paths: [String]
+    var tags: [String]
+    var dependsOn: [String]     // Part-IDs
+    var suggestedAgent: String?
+    var agentId: String?        // eingeteilter Agent (nil = beliebiger Worker)
+    /// draft → (Freigabe) → waiting (Abhängigkeiten offen) → queued → running → delivered → accepted
+    /// Nebenpfade: failed, cancelled; Nacharbeit setzt zurück auf draft.
+    var status: String
+    var taskIds: [String]
+    var result: String?
+    var note: String?           // Nacharbeits- oder Abnahme-Notiz
+    var round: Int              // 1 = erste Ausführung, ab 2 = Nacharbeit
+    var approvedAt: Double?
+    var finishedAt: Double?
+}
+
+struct Project: Codable {
+    var id: String
+    var name: String
+    var goal: String
+    var cwd: String
+    var managerId: String?
+    var status: String          // planning | review | running | done | cancelled
+    var summary: String
+    var standards: [ProjectStandard]
+    var parts: [ProjectPart]
+    var planTaskIds: [String]
+    var revision: Int
+    var requireReview: Bool     // Ergebnisse muss der Manager (oder du) abnehmen
+    var log: [ProgressEntry]
+    var createdAt: Double
+    var updatedAt: Double
+    var finishedAt: Double?
+    /// Zeitpunkt des letzten eingereichten Plans – danach gilt ein offener Planungsauftrag nicht mehr als „plant noch“.
+    var planSubmittedAt: Double? = nil
+}
+
 struct Webhook: Codable {
     var id: String
     var url: String
@@ -126,6 +183,7 @@ struct Database: Codable {
     var workflows: [Workflow] = []
     var runs: [WorkflowRun] = []
     var webhooks: [Webhook] = []
+    var projects: [Project] = []
     var settings: Settings = .default
     var events: [EventEntry] = []
 
@@ -140,6 +198,7 @@ struct Database: Codable {
         workflows = (try? c.decode([Workflow].self, forKey: .workflows)) ?? []
         runs = (try? c.decode([WorkflowRun].self, forKey: .runs)) ?? []
         webhooks = (try? c.decode([Webhook].self, forKey: .webhooks)) ?? []
+        projects = (try? c.decode([Project].self, forKey: .projects)) ?? []
         settings = (try? c.decode(Settings.self, forKey: .settings)) ?? .default
         events = (try? c.decode([EventEntry].self, forKey: .events)) ?? []
     }
